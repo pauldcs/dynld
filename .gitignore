@@ -11,4 +11,5 @@ test/**/hello_world
 test/**/*.o
 test/**/*.a
 test/**/*.dylib
-test/**/run
+test/run
+test/outfiles

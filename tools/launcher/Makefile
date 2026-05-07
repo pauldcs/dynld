@@ -64,7 +64,6 @@ $(NAME): $(SRCS_OBJS) dyld75
 	$(MAKE) -C $(LIBTLV_DIR)
 	$(CC) $(filter-out dyld75,$^) $(CFLAGS) \
 	    -I $(INCS_DIR) \
-			-L $(LIBVECTOR_DIR) -lvector \
 			-Wl,-stack_size,0x10000000 \
 	    -o $(NAME)
 
