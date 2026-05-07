@@ -1,0 +1,7 @@
+[package]
+name = "dynld-std"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+sys = { path = "../../libs/sys" }

@@ -1,0 +1,31 @@
+[build]
+target = "aarch64-apple-darwin"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-args=-Wl,-dylinker",
+    "-C", "link-args=-Wl,-e,__dyld_start",
+    "-C", "link-args=-nostartfiles",
+    "-C", "link-args=-Wl,-no_pie",
+    "-C", "link-args=-Wl,-segalign,0x4000",
+    "-C", "link-args=-Wl,-no_inits",
+    "-C", "link-args=-Wl,-fixup_chains",
+    "-C", "link-args=-Wl,-data_const",
+
+    # these are because we need those to compile the thread local var handling lib
+    # taken from dyld, but we cannot compile with the pthread lib or the stdlib...
+    # we need to manually overwrite those at runtime with the actual stuff
+    "-C", "link-args=-Wl,-U,_malloc",
+    "-C", "link-args=-Wl,-U,_free",
+    "-C", "link-args=-Wl,-U,_abort",
+    "-C", "link-args=-Wl,-U,_pthread_key_create",
+    "-C", "link-args=-Wl,-U,_pthread_getspecific",
+    "-C", "link-args=-Wl,-U,_pthread_setspecific",
+    "-C", "link-args=-Wl,-U,_pthread_mutex_lock",
+    "-C", "link-args=-Wl,-U,_pthread_mutex_unlock",
+    "-C", "link-args=-Wl,-not_for_dyld_shared_cache"
+]

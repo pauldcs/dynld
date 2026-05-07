@@ -1,0 +1,346 @@
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <mach-o/loader.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/*
+ *    This program tests a dynamic linker.
+ *
+ *    It is supposed to mimic how a kernel would invoke a dynamic linker for
+ *    a given program. Note that this does not exactly work the same way XNU
+ *    calls dyld, the most important difference is that when passing the
+ *    pointers to the dynamic linkers header and the programs header,
+ *    we also provide their respective sizes.
+ *
+ *    We don't really need to respect the exact calling convention of
+ *    dyld as there wouldn't even be any way to attempt to really replace
+ *    dyld. XNU has security mechanisms which make it impossible to actually
+ *    use a dynamic linker other than dyld with en execve call.
+ *    Even when compiling a kernel for DEBUG or DEVELOPMENT, the dynamic
+ *    linker would still need to be signed by apple in order for the kernel
+ *    to accept it as a valid dynamic linker provided through a `LC_LOAD_DYLINKER`
+ *    load command...
+ *
+ *    If someone if willing to write a XNU patch for this, i will gladly
+ *    implement the exact calling convention, but until then this is fine.
+ *    If we want to do this, i think it would be enough to just patch these
+ *    two checks in the `load_dylinker` function of XNU:
+ *
+ *    around line 3230:
+ *    if (0 != strcmp(name, DEFAULT_DYLD_PATH)) {
+ *	      return LOAD_BADMACHO;
+ *    }
+ *
+ * 		around line 3280:
+ *    if (!myresult->platform_binary) {
+ *		    result->csflags &= ~CS_NO_UNTRUSTED_HELPERS;
+ *	  }
+ */
+
+/*
+ *    This is how the stack has to look like before jumpting to the
+ *    entrypoint of dyld (`__dyld_start`). A little bit modified
+ */
+struct info_struct {
+	// a pointer to the header of the dynamic linker.
+	// note that we do NOT supports FAT headers, i don't
+	// know if it is even possible for a dynamic linker to
+	// be fat but regardless of this, we don't support it
+	struct mach_header_64 *dylinker_header;
+
+	// a pointer to the header of the executable image.
+	// this can be a FAT arch containing an arm64 binary
+	// or a regular arm64 executable
+	struct mach_header_64 *executable_header;
+
+	// the total size in bytes of the dynamic linker
+	size_t		       dylinker_size;
+
+	// the total size in bytes of the executable
+	size_t		       executable_size;
+
+	// argc passed to the executable
+	size_t		       argc;
+
+	// argv passed to the executable
+	const char *const     *argv;
+
+	// envp passed to the executable
+	const char *const     *envp;
+
+	// the apple args passed to the executable
+	const char *const     *apple;
+};
+
+/*
+ *    This function places the pointer to the `info_struct` in
+ *    in the stack pointer. Dyld expects the stack pointer to point
+ *    to this struct before being called
+ */
+__attribute__((noreturn)) static void
+transfer_control(struct info_struct *init_info, void *start)
+{
+	__asm__ __volatile__("mov sp, %0" ::"r"(init_info));
+
+	((void (*)(void))start)();
+
+	__builtin_unreachable();
+}
+
+/*
+ *    Loads a mach-o file into memory using mmap.
+ *
+ *    We use a private, anonymous mapping rather than mapping the file
+ *    directly because we need the resulting region to be writable for
+ *    the rebasing/protection adjustments performed later. A file-backed
+ *    MAP_PRIVATE mapping would also work, but switching protections on
+ *    individual segments later (via mach_vm_protect) is cleaner against
+ *    an anonymous region that we own outright.
+ */
+static void *load_macho(
+	const char	  *path,
+	mach_vm_address_t *out_addr,
+	mach_vm_size_t	  *out_size
+)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd == -1) {
+		(void)fprintf(
+			stderr, "%s: %s\n", path, strerror(errno)
+		);
+		return (NULL);
+	}
+
+	struct stat st;
+	if (fstat(fd, &st) == -1) {
+		(void)fprintf(
+			stderr,
+			"fstat: %s: %s\n",
+			path,
+			strerror(errno)
+		);
+		(void)close(fd);
+		return (NULL);
+	}
+
+	if (st.st_size <= 0) {
+		(void)fprintf(stderr, "%s: empty file\n", path);
+		(void)close(fd);
+		return (NULL);
+	}
+
+	size_t file_size = (size_t)st.st_size;
+	size_t page_size = (file_size + vm_page_size - 1) &
+			   ~((size_t)vm_page_size - 1);
+
+	void *addr = mmap(
+		NULL,
+		page_size,
+		PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANON,
+		-1,
+		0
+	);
+	if (addr == MAP_FAILED) {
+		(void)fprintf(
+			stderr, "mmap: %s\n", strerror(errno)
+		);
+		(void)close(fd);
+		return (NULL);
+	}
+
+	size_t total = 0;
+	while (total < file_size) {
+		ssize_t n = read(
+			fd,
+			(char *)addr + total,
+			file_size - total
+		);
+		if (n == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
+			(void)fprintf(
+				stderr,
+				"read: %s: %s\n",
+				path,
+				strerror(errno)
+			);
+			(void)munmap(addr, page_size);
+			(void)close(fd);
+			return (NULL);
+		}
+		if (n == 0) {
+			(void)fprintf(
+				stderr,
+				"%s: unexpected EOF\n",
+				path
+			);
+			(void)munmap(addr, page_size);
+			(void)close(fd);
+			return (NULL);
+		}
+		total += (size_t)n;
+	}
+
+	(void)close(fd);
+
+	if (out_addr) {
+		*out_addr = (mach_vm_address_t)(uintptr_t)addr;
+	}
+
+	if (out_size) {
+		*out_size = page_size;
+	}
+
+	return (addr);
+}
+
+int main(int ac, char *av[], char *apple[])
+{
+	const char *macho_path	  = av[1];
+	const char *dylinker_path = av[2];
+
+	mach_vm_address_t macho_addr;
+	mach_vm_address_t dyld_addr;
+	mach_vm_size_t	  macho_size;
+	mach_vm_size_t	  dyld_size;
+
+	if (ac < 3) {
+		(void)fprintf(
+			stderr,
+			"usage: %s <macho> <dylinker>\n",
+			av[0]
+		);
+
+		return (EXIT_FAILURE);
+	}
+
+	if (!load_macho(macho_path, &macho_addr, &macho_size)) {
+		return (EXIT_FAILURE);
+	}
+
+	if (!load_macho(dylinker_path, &dyld_addr, &dyld_size)) {
+		return (EXIT_FAILURE);
+	}
+
+	const struct mach_header_64 *mach_header =
+		(const struct mach_header_64 *)dyld_addr;
+
+	assert(mach_header->magic == MH_MAGIC_64);
+	assert(mach_header->filetype == MH_DYLINKER);
+
+	/*
+	 *    We need to parse the load commands of the program to be
+	 *    able to apply memory protections to it. We cannot simply make
+	 *    the whole blob exectable as dyld does some rebasing of where
+	 *    it needs write permissions to some segments of itself
+	 */
+
+	struct load_command *lc	   = (void *)(mach_header + 1);
+	intptr_t	     slide = 0;
+	uint32_t	     i	   = 0;
+
+	while (i < mach_header->ncmds) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64 *seg = (void *)lc;
+			slide = (intptr_t)mach_header -
+				(intptr_t)seg->vmaddr;
+			break;
+		}
+		lc = (void *)((char *)lc + lc->cmdsize);
+		i++;
+	}
+
+	lc = (void *)(mach_header + 1);
+	i  = 0;
+
+	while (i < mach_header->ncmds) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64 *seg = (void *)lc;
+			(void)mach_vm_protect(
+				mach_task_self(),
+				seg->vmaddr + slide,
+				seg->vmsize,
+				FALSE,
+				seg->initprot
+			);
+		}
+		lc = (void *)((char *)lc + lc->cmdsize);
+		i++;
+	}
+
+	/*
+	 *    The following segment of code is there to find the
+	 *    entrypoint of the the dynamic linker.
+	 *
+	 *    We look for `LC_UNIXTHREAD`, and once we find it we extract
+	 *    the thread state to get the entry point. We have to do this
+	 *    due to the fact that the linker is under constant development
+	 *    and the entrypoint varies accros compilations.
+	 *
+	 *    Once it stabilizes the entrypoint will be made somehow
+	 *    persistent and we will be able to skip this part.
+	 */
+
+	uint64_t dyld_entry = 0;
+	lc = (void *)(mach_header + 1);
+	i  = 0;
+	while (i < mach_header->ncmds) {
+		if (lc->cmd == LC_UNIXTHREAD) {
+			uint32_t *p =
+				(uint32_t *)((char *)lc +
+					     sizeof(
+						     struct thread_command
+					     ));
+			uint32_t flavor = p[0];
+			void *state = &p[2];
+
+#if defined(__x86_64__)
+			if (flavor == x86_THREAD_STATE64) {
+				x86_thread_state64_t *ts =
+					(x86_thread_state64_t *)state;
+				dyld_entry = ts->__rip;
+			}
+#elif defined(__arm64__) || defined(__aarch64__)
+			if (flavor == ARM_THREAD_STATE64) {
+				arm_thread_state64_t *ts =
+					(arm_thread_state64_t *)state;
+				dyld_entry = ts->__pc;
+			}
+#endif
+			break;
+		}
+		lc = (void *)((char *)lc + lc->cmdsize);
+		i++;
+	}
+
+	assert(dyld_entry != 0);
+
+	void *entry = (void *)((uintptr_t)dyld_entry + slide);
+
+	struct info_struct info = {
+		.dylinker_header = (struct mach_header_64 *)dyld_addr,
+		.executable_header =
+			(struct mach_header_64 *)macho_addr,
+		.dylinker_size	 = dyld_size,
+		.executable_size = macho_size,
+		.argc		 = 0,
+		.argv		 = NULL,
+		.envp		 = NULL,
+		.apple		 = (const char *const *)apple,
+	};
+
+	/*
+	 *    This jumps to dyld, we expect this to not return
+	 */
+	transfer_control(&info, entry);
+}

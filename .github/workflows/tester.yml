@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  tests:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (macOS)
+        run: |
+          brew update
+          brew install coreutils
+
+      - name: Build dynld
+        working-directory: example
+        run: |
+          make
+
+      - name: Run tester.sh
+        working-directory: test
+        run: |
+          mv ../tools/launcher/run .
+          chmod +x run.sh
+          chmod +x execvm_example
+          ./run.sh
