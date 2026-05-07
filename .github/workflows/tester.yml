@@ -19,10 +19,6 @@ jobs:
           brew update
           brew install coreutils
 
-      - name: Build dynld
-        run: |
-          make
-
       - name: Run tester.sh
         working-directory: test
         run: |

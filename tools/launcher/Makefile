@@ -4,7 +4,6 @@ SRCS_DIR        := srcs
 OBJS_DIR        := .objs
 INCS_DIR        := incs
 DYNLD_DIR      := ../..
-LIBVECTOR_DIR   := libvector
 LIBTLV_DIR      := ../../cxx_libtlv
 
 DEBUG ?= 0
@@ -29,7 +28,6 @@ else
 endif
 
 DYLD75 := $(DYNLD_DIR)/target/aarch64-apple-darwin/$(BUILD_MODE)/dyld75
-VECTOR_LIB := $(LIBVECTOR_DIR)/libvector.a
 
 CFLAGS := \
     $(CFLAGS_MODE)
@@ -64,7 +62,6 @@ dyld75:
 
 $(NAME): $(SRCS_OBJS) dyld75
 	$(MAKE) -C $(LIBTLV_DIR)
-	$(MAKE) -C $(LIBVECTOR_DIR)
 	$(CC) $(filter-out dyld75,$^) $(CFLAGS) \
 	    -I $(INCS_DIR) \
 			-L $(LIBVECTOR_DIR) -lvector \
@@ -73,7 +70,6 @@ $(NAME): $(SRCS_OBJS) dyld75
 
 clean:
 	$(MAKE) clean -C $(LIBTLV_DIR)
-	$(MAKE) clean -C $(LIBVECTOR_DIR)
 	rm -rf target
 	rm -rf $(DYNLD_DIR)/target
 	rm -rf build
@@ -82,7 +78,6 @@ clean:
 
 fclean: clean
 	$(MAKE) fclean -C $(LIBTLV_DIR)
-	$(MAKE) fclean -C $(LIBVECTOR_DIR)
 	rm -rf $(NAME)
 
 format:

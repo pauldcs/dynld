@@ -7,7 +7,8 @@ tools/launcher/run
 tools/launcher/.cache
 tools/launcher/compile_commands.json
 .DS_Store
-tests/**/hello_world
-tests/**/*.o
-tests/**/*.a
-tests/**/*.dylib
+test/**/hello_world
+test/**/*.o
+test/**/*.a
+test/**/*.dylib
+test/**/run
