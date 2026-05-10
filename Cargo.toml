@@ -12,13 +12,7 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-[workspace]
-resolver = "2"
-members = ["libs/*", "crates/*"]
 
 [dependencies]
-sys    = { path = "libs/sys" }
-array  = { path = "libs/array" }
-dynld-std = { path = "crates/dynld-std" }
-dynld-core = { path = "crates/dynld-core" }
-dynld-alloc = { path = "crates/dynld-alloc" }
+scroll = { version = "0.13.0", default-features = false }
+scroll_derive = "0.13.1"

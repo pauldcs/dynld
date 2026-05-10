@@ -1,28 +1,63 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
+//#![deny(clippy::undocumented_unsafe_blocks)]
 
-use array::array_vec::ArrayVec;
-use core::{
-    arch::global_asm,
-    ptr::{self},
-};
-use dynld_alloc::{Allocator, VM};
-use dynld_core::{
-    Container, Image,
-    bindings::macho::{mach_header_64, mach_magic},
+use crate::{
+    array::ArrayVec,
+    bindings_macho::{mach_header_64, mach_magic},
+    container::Container,
     dynld::macho_endian_from_magic,
     entrypoint::dynld_entrypoint,
-    fixup_all_chained_fixups,
+    fixups::fixup_all_chained_fixups,
+    heap::{Allocator, VM},
+    image::Image,
+    libc::{EXIT_FAILURE, STDERR_FILENO, exit_error},
 };
-use dynld_std::{self, EXIT_FAILURE, STDERR_FILENO};
-use sys::unistd::exit_error;
+use core::arch::global_asm;
 
 extern crate alloc;
 use alloc::vec::Vec;
 
-global_asm!(include_str!("dyld_start.s"));
+// All modules are public to avoid all the unused functions errors
+
+#[allow(non_camel_case_types)]
+pub mod bindings_dsc;
+
+#[allow(non_camel_case_types)]
+pub mod bindings_macho;
+
+#[allow(non_camel_case_types)]
+pub mod mach;
+
+#[allow(non_camel_case_types)]
+pub mod mmap;
+
+#[allow(non_camel_case_types, non_snake_case)]
+pub mod dsc;
+
+pub mod array;
+pub mod container;
+pub mod dyld_shared_cache;
+pub mod dylib;
+pub mod dynld;
+pub mod entrypoint;
+pub mod fixups;
+pub mod heap;
+pub mod image;
+pub mod jump;
+pub mod libc;
+pub mod print;
+pub mod syscalls;
+pub mod tlv;
+
+pub(crate) const PAGE_ZERO_SIZE: usize = 0x100000000;
+// pub(crate) const DYLD_SHARED_CACHE_PATH: &str =
+//     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e\0";
+
+global_asm!(include_str!("__dyld_start.s"));
+
+static mut HAS_REBASED_SELF: bool = false;
 
 /// Currently, we only want to support ARM64
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -33,12 +68,18 @@ compile_error!("cuurently dynld only targets aarch64-apple-darwin");
 /// note that you cannot use println or anything that uses data pointers in
 /// this handler. This handler might be called before we were able to rebase ourselves
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // println_err!("panic: {info}");
-    let _ = sys::write(STDERR_FILENO, b"panic\n");
-    let _ = sys::exit(EXIT_FAILURE);
-    #[allow(deref_nullptr)]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    if unsafe { HAS_REBASED_SELF } {
+        println_err!("panic: {info}");
+    } else {
+        let _ = libc::write(STDERR_FILENO, b"panic\n");
+    }
+    let _ = libc::exit(EXIT_FAILURE);
+
+    // if exit failed, we segfault to kill the process
+    #[allow(deref_nullptr, clippy::zero_ptr)]
     let _ = unsafe { *(0 as *const u8) };
+
     loop {}
 }
 
@@ -77,7 +118,7 @@ pub struct Stack {
 /// been protected with `vm_protect` with `VM_PROT_WRITE` before for this to work.
 fn rebase_self(self_header: *mut u8, self_size: usize) {
     // wrap the binary blob in a Container in order to be able to parse it
-    let magic = unsafe { ptr::read_unaligned(self_header as *const mach_magic) };
+    let magic = unsafe { core::ptr::read_unaligned(self_header as *const mach_magic) };
     let dylinker_container = Container::with_bytes(
         unsafe { core::slice::from_raw_parts(self_header, self_size) },
         macho_endian_from_magic(magic),
@@ -100,7 +141,7 @@ fn rebase_self(self_header: *mut u8, self_size: usize) {
                     true,
                 )
                 .map_err(|_| {
-                    let _ = sys::write(STDERR_FILENO, b"self rebase error, exiting ...\n");
+                    let _ = libc::write(STDERR_FILENO, b"self rebase error, exiting ...\n");
                     exit_error()
                 });
             }
@@ -109,8 +150,8 @@ fn rebase_self(self_header: *mut u8, self_size: usize) {
             // we cannot use `println_err` here as we failed to rebase ourselves so we
             // cannot trust any of our DATA pointers, we do this bare write
             // to inform the user and just exit
-            let _ = sys::write(STDERR_FILENO, error.as_bytes());
-            let _ = sys::write(STDERR_FILENO, b"\nexiting ...\n");
+            let _ = libc::write(STDERR_FILENO, error.as_bytes());
+            let _ = libc::write(STDERR_FILENO, b"\nexiting ...\n");
 
             // bye
             exit_error()
@@ -139,6 +180,7 @@ pub unsafe extern "C" fn start(info: *const Stack) {
     // none of the data pointers in the current binary are valid before
     // this function has been executed.
     rebase_self(*dylinker_header as *mut u8, *dylinker_size);
+    unsafe { HAS_REBASED_SELF = true };
 
     dynld_entrypoint(
         *executable_header as *mut mach_header_64,

@@ -13,3 +13,4 @@ test/**/*.a
 test/**/*.dylib
 test/run
 test/outfiles
+*.dSYM

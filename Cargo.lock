@@ -3,58 +3,12 @@
 version = 4
 
 [[package]]
-name = "array"
-version = "0.1.0"
-
-[[package]]
-name = "container"
-version = "0.1.0"
-dependencies = [
- "scroll",
- "scroll_derive",
-]
-
-[[package]]
 name = "dynld"
 version = "0.0.1"
 dependencies = [
- "array",
- "dynld-alloc",
- "dynld-core",
- "dynld-std",
- "sys",
-]
-
-[[package]]
-name = "dynld-alloc"
-version = "0.0.1"
-dependencies = [
- "sys",
-]
-
-[[package]]
-name = "dynld-core"
-version = "0.0.1"
-dependencies = [
- "array",
- "container",
- "dynld-std",
- "jump",
  "scroll",
  "scroll_derive",
- "sys",
 ]
-
-[[package]]
-name = "dynld-std"
-version = "0.0.1"
-dependencies = [
- "sys",
-]
-
-[[package]]
-name = "jump"
-version = "0.0.1"
 
 [[package]]
 name = "proc-macro2"
@@ -64,10 +18,6 @@ checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
-
-[[package]]
-name = "ptrauth"
-version = "0.0.1"
 
 [[package]]
 name = "quote"
@@ -105,10 +55,6 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
-
-[[package]]
-name = "sys"
-version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

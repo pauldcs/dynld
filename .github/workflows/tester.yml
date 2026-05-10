@@ -29,5 +29,5 @@ jobs:
         run: |
           mv ../tools/launcher/run .
           chmod +x run.sh
-          chmod +x execvm_example
+          chmod +x run
           ./run.sh

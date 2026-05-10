@@ -3,8 +3,9 @@ CC              := gcc
 SRCS_DIR        := srcs
 OBJS_DIR        := .objs
 INCS_DIR        := incs
-DYNLD_DIR      := ../..
-LIBTLV_DIR      := ../../cxx_libtlv
+DYNLD_DIR       := ../..
+LIBTLV_DIR      := ../../libtlv
+LIBDSC_DIR      := ../../libdsc
 
 DEBUG ?= 0
 ifeq ($(DEBUG), 1)
@@ -26,8 +27,6 @@ else
     CARGO_FLAGS := --release
     CFLAGS_MODE := -O3
 endif
-
-DYLD75 := $(DYNLD_DIR)/target/aarch64-apple-darwin/$(BUILD_MODE)/dyld75
 
 CFLAGS := \
     $(CFLAGS_MODE)
@@ -57,18 +56,22 @@ g:
 
 -include $(SRCS_OBJS:.o=.d)
 
-dyld75:
+dynld:
 	cargo build --manifest-path $(DYNLD_DIR)/Cargo.toml $(CARGO_FLAGS)
 
-$(NAME): $(SRCS_OBJS) dyld75
+$(NAME): $(SRCS_OBJS) dynld
 	$(MAKE) -C $(LIBTLV_DIR)
-	$(CC) $(filter-out dyld75,$^) $(CFLAGS) \
+	$(MAKE) -C $(LIBDSC_DIR)
+	$(CC) $(filter-out dynld,$^) $(CFLAGS) \
 	    -I $(INCS_DIR) \
 			-Wl,-stack_size,0x10000000 \
+			-L$(LIBTLV_DIR) -ltlv \
+			-L$(LIBDSC_DIR) -ldsc \
 	    -o $(NAME)
 
 clean:
 	$(MAKE) clean -C $(LIBTLV_DIR)
+	$(MAKE) clean -C $(LIBDSC_DIR)
 	rm -rf target
 	rm -rf $(DYNLD_DIR)/target
 	rm -rf build
@@ -77,6 +80,7 @@ clean:
 
 fclean: clean
 	$(MAKE) fclean -C $(LIBTLV_DIR)
+	$(MAKE) fclean -C $(LIBDSC_DIR)
 	rm -rf $(NAME)
 
 format:

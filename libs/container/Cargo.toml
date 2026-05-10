@@ -1,8 +1,0 @@
-[package]
-name = "container"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-scroll = { version = "0.13.0", default-features = false }
-scroll_derive = "0.13.1"

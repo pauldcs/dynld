@@ -49,6 +49,7 @@
  *    This is how the stack has to look like before jumpting to the
  *    entrypoint of dyld (`__dyld_start`). A little bit modified
  */
+
 struct info_struct {
 	// a pointer to the header of the dynamic linker.
 	// note that we do NOT supports FAT headers, i don't

@@ -18,7 +18,7 @@ rustflags = [
 
     # these are because we need those to compile the thread local var handling lib
     # taken from dyld, but we cannot compile with the pthread lib or the stdlib...
-    # we need to manually overwrite those at runtime with the actual stuff
+    # we need to manually overwrite those with resolved symbol addresses at runtime
     "-C", "link-args=-Wl,-U,_malloc",
     "-C", "link-args=-Wl,-U,_free",
     "-C", "link-args=-Wl,-U,_abort",
