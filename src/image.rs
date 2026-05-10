@@ -1,4 +1,5 @@
 use crate::{
+    SYMBOL_NAME_LEN,
     array::ArrayString,
     bindings_macho::{SELF_LIBRARY_ORDINAL, load_command, mach_header_64},
     container::Container,
@@ -47,7 +48,7 @@ pub enum ThreadLocalKind {
 #[allow(unused)]
 pub struct Symbol {
     lib_ordinal: u8,
-    pub name: ArrayString<256>,
+    pub name: ArrayString<SYMBOL_NAME_LEN>,
     pub impl_offset: usize,
     sect_num: u8,
     value: usize,
@@ -57,7 +58,11 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    pub fn make_undefined(name: ArrayString<256>, lib_ordinal: u8, is_weak: bool) -> Self {
+    pub fn make_undefined(
+        name: ArrayString<SYMBOL_NAME_LEN>,
+        lib_ordinal: u8,
+        is_weak: bool,
+    ) -> Self {
         Self {
             lib_ordinal,
             name,
@@ -71,7 +76,7 @@ impl Symbol {
     }
 
     pub fn make_regular_local(
-        name: ArrayString<256>,
+        name: ArrayString<SYMBOL_NAME_LEN>,
         image_offset: usize,
         sect_num: u8,
         is_cold: bool,
@@ -90,7 +95,7 @@ impl Symbol {
     }
 
     pub fn make_regular_export(
-        name: ArrayString<256>,
+        name: ArrayString<SYMBOL_NAME_LEN>,
         image_offset: usize,
         sect_num: u8,
         is_cold: bool,
@@ -109,7 +114,7 @@ impl Symbol {
     }
 
     pub fn make_weak_def_export(
-        name: ArrayString<256>,
+        name: ArrayString<SYMBOL_NAME_LEN>,
         image_offset: usize,
         sect_num: u8,
         is_cold: bool,
