@@ -70,8 +70,7 @@ struct user64_dyld_all_image_infos {
 };
 
 // raw mach_task_self
-__attribute((always_inline))
-static inline mach_port_t
+__attribute__((noinline)) static mach_port_t
 _mach_task_self(void)
 {
 #define MACH_TASK_SELF_TRAP (-28)
@@ -89,8 +88,7 @@ _mach_task_self(void)
 }
 
 // raw mach_msg2
-__attribute((always_inline))
-static inline kern_return_t
+__attribute__((noinline)) static kern_return_t
 _mach_msg2(void                    *data,
            uint64_t                 options,
            mach_msg_bits_t          msgh_bits,
@@ -133,8 +131,7 @@ _mach_msg2(void                    *data,
 }
 
 // raw mach_reply_port
-__attribute((always_inline))
-static inline mach_port_t
+__attribute__((noinline)) static mach_port_t
 _mach_reply_port(void)
 {
 #define MACH_REPLY_PORT_TRAP (-26)
@@ -151,8 +148,7 @@ _mach_reply_port(void)
 }
 
 // raw mach_port_mod_refs
-__attribute((always_inline))
-static inline kern_return_t
+__attribute((noinline)) static kern_return_t
 _mach_port_mod_refs(mach_port_t        target,
                     mach_port_t        name,
                     mach_port_right_t  right,
