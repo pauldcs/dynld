@@ -1,5 +1,3 @@
-#![no_std]
-
 /// Sign an instruction pointer with key A.
 ///
 /// Uses the supplied context value as the modifier.

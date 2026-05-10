@@ -1,8 +1,17 @@
 use core::ptr::NonNull;
 
+use alloc::vec::Vec;
+
 use crate::{
-    bindings_macho::mach_header_64, dsc, dyld_shared_cache::DyldSharedCache,
-    dynld::dynamically_link, jump, libc::exit_error, println_err,
+    bindings_macho::{CPU_TYPE_ARM64, fat_arch, fat_header, mach_header_64, mach_magic},
+    container::Container,
+    dsc,
+    dyld_shared_cache::DyldSharedCache,
+    dynld::{dynamically_link, macho_endian_from_magic},
+    fixups::Fixup,
+    jump,
+    libc::exit_error,
+    println_err,
 };
 
 /// The main entrypoint of the dynld
@@ -13,6 +22,7 @@ use crate::{
 /// This function never returns and if an internal error happens, it will loop
 /// infinitly.
 pub fn dynld_entrypoint(
+    _self_bind_fixups: Vec<Fixup>,
     executable_header: *mut mach_header_64,
     executable_size: usize,
     argc: usize,
@@ -20,11 +30,35 @@ pub fn dynld_entrypoint(
     envp: *const *const u8,
     _apple: *const *const u8,
 ) -> ! {
+    let image_raw_bytes =
+        unsafe { core::slice::from_raw_parts(executable_header as *const u8, executable_size) };
+
+    let image_mach_magic =
+        unsafe { core::ptr::read_unaligned(executable_header as *const mach_magic) };
+
+    let image = arm64_container_create(&Container::with_bytes(
+        image_raw_bytes,
+        macho_endian_from_magic(image_mach_magic),
+    ))
+    .map_err(|err: &str| {
+        println_err!("failed to create an arm64 container: {err}");
+        exit_error()
+    })
+    .unwrap();
+
     let mut dyld_shared_cache_baddr_in_vm = 0;
     if unsafe { dsc::dyld_shared_cache_base_address_get(&mut dyld_shared_cache_baddr_in_vm) } == 0 {
         println_err!("failed to find the dyld_shared_cache base address");
         exit_error()
     }
+
+    // let mut image_infos = dsc::user64_dyld_all_image_infos::default();
+    // if unsafe { dsc::dyld_all_image_infos_get(&mut image_infos) } == 0 {
+    //     println_err!("failed to find the dyld_shared_cache base address");
+    //     exit_error()
+    // }
+
+    // print!("{image_infos:#?}");
 
     let mut dyld_shared_cache = DyldSharedCache::new();
     if let Err(err) = unsafe {
@@ -37,13 +71,7 @@ pub fn dynld_entrypoint(
         exit_error()
     }
 
-    //println!("{:#?}", dyld_shared_cache.libraries);
-    let entry_point = dynamically_link(
-        &dyld_shared_cache,
-        executable_header as *mut u8,
-        executable_size,
-    )
-    .unwrap_or_else(|err| {
+    let entry_point = dynamically_link(&dyld_shared_cache, image).unwrap_or_else(|err| {
         println_err!("dylinking error: '{err}', giving up...");
         exit_error()
     });
@@ -75,4 +103,59 @@ pub fn dynld_entrypoint(
     // if that does not work
 
     exit_error()
+}
+
+/// Tries to find an image with a `CPU_TYPE_ARM64` cputype
+///
+/// If the container is a fat_magic image, we try to find
+/// the correct architecture within it
+fn arm64_container_create<'bytes>(
+    image_container: &Container<'bytes>,
+) -> Result<Container<'bytes>, &'static str> {
+    let header = image_container
+        .deserialize_type_at_offset::<mach_header_64>(0)
+        .unwrap();
+
+    // if the image already has a CPU_TYPE_ARM64 cputype,
+    // we can return it
+    if header.magic == mach_magic::MH_MAGIC_64 && header.cputype == CPU_TYPE_ARM64 {
+        return Ok(*image_container);
+    }
+
+    // if this is not a fat binary and is not a CPU_TYPE_ARM64,
+    // we return an error
+    if header.magic != mach_magic::FAT_MAGIC {
+        return Err("Not a valid ARM64 Mach-O or fat binary");
+    }
+
+    let fat_header = image_container
+        .deserialize_type_at_offset::<fat_header>(0)
+        .unwrap();
+    (0..fat_header.nfat_arch)
+        .filter_map(|index| {
+            let offset = size_of::<fat_header>() + index as usize * size_of::<fat_arch>();
+
+            let fat_arch { offset, size, .. } = image_container
+                .deserialize_type_at_offset::<fat_arch>(offset)
+                .ok()?;
+
+            image_container
+                .slice(offset as usize, size as usize)
+                .map(|bytes| {
+                    Container::with_bytes(
+                        bytes,
+                        macho_endian_from_magic(unsafe {
+                            core::ptr::read_unaligned(bytes.as_ptr() as *const mach_magic)
+                        }),
+                    )
+                })
+        })
+        .find(|container| {
+            container
+                .deserialize_type_at_offset::<mach_header_64>(0)
+                .map(|h| h.magic == mach_magic::MH_MAGIC_64 && h.cputype == CPU_TYPE_ARM64)
+                .unwrap_or(false)
+        })
+        .map(|container| arm64_container_create(&container))
+        .ok_or_else(|| "error: could not read `mach_header_64` from inner mach-o")?
 }

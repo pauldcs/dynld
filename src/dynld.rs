@@ -1,4 +1,4 @@
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -7,12 +7,12 @@ use crate::{
     PAGE_ZERO_SIZE, SYMBOL_NAME_LEN,
     array::{ArrayString, ArrayVec},
     bindings_macho::{
-        CPU_TYPE_ARM64, LC_REQ_DYLD, N_ALT_ENTRY, N_ARM_THUMB_DEF, N_COLD_FUNC, N_EXT, N_PEXT,
-        N_SECT, N_STAB, N_SYMBOL_RESOLVER, N_TYPE, N_UNDF, N_WEAK_DEF, N_WEAK_REF,
-        S_INIT_FUNC_OFFSETS, S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, SEG_DATA, SEG_TEXT,
-        dylib_command, entry_point_command, fat_arch, fat_header, get_library_ordinal,
-        load_command, load_command_variants, mach_header_64, mach_magic, macho_filetype_variants,
-        nlist_64, section_64, segment_command_64, symtab_command,
+        LC_REQ_DYLD, N_ALT_ENTRY, N_ARM_THUMB_DEF, N_COLD_FUNC, N_EXT, N_PEXT, N_SECT, N_STAB,
+        N_SYMBOL_RESOLVER, N_TYPE, N_UNDF, N_WEAK_DEF, N_WEAK_REF, S_INIT_FUNC_OFFSETS,
+        S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, SEG_DATA, SEG_TEXT, dylib_command,
+        entry_point_command, get_library_ordinal, load_command, load_command_variants,
+        mach_header_64, mach_magic, macho_filetype_variants, nlist_64, section_64,
+        segment_command_64, symtab_command,
     },
     container::{self, Container},
     dyld_shared_cache::DyldSharedCache,
