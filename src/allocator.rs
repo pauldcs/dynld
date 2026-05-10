@@ -1,8 +1,7 @@
 //! A simple global allocator backed by our mach vm wrappers. This was prompted from
-//! AI (Claude) and i did not test it properly. If anyone wants to do this and write
-//! a good allocator it would be great, i unfortunatly can only work on this project
-//! during nights and needed this to be able to keep working on parsing the dyld_shared_cache,
-//! i also use it to hold symbols and fixups within vector
+//! Claude and i did not test it properly at all. We should replace this with a better
+//! allocator as soon as possible. This is only used for things such as holding symbols,
+//! which are not expected to change (not a lot of alloc/dealloc)
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
