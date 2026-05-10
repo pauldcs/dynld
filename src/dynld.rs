@@ -1,10 +1,10 @@
-use core::ptr::{self};
+use core::ptr::{self, NonNull};
 
 extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::{
-    PAGE_ZERO_SIZE,
+    PAGE_ZERO_SIZE, SYMBOL_NAME_LEN,
     array::{ArrayString, ArrayVec},
     bindings_macho::{
         CPU_TYPE_ARM64, LC_REQ_DYLD, N_ALT_ENTRY, N_ARM_THUMB_DEF, N_COLD_FUNC, N_EXT, N_PEXT,
@@ -16,9 +16,9 @@ use crate::{
     },
     container::{self, Container},
     dyld_shared_cache::DyldSharedCache,
-    fixups::fixup_all_chained_fixups,
+    fixups::{Fixup, fixup_all_chained_fixups},
     image::{Image, Segment, Symbol},
-    mach,
+    jump, mach,
 };
 
 pub fn macho_endian_from_magic(magic: mach_magic) -> container::Endian {
@@ -33,460 +33,440 @@ pub fn macho_endian_from_magic(magic: mach_magic) -> container::Endian {
     }
 }
 
-/// Dynamically link the program
+/// Parsed contents of a Mach-O image, ready to be mapped and linked.
+struct ParsedImage<'a> {
+    segments: ArrayVec<Segment, 64>,
+    fixups: Vec<Fixup>,
+    symbols: Vec<Symbol>,
+    init_functions: Vec<usize>,
+    libraries: ArrayVec<(&'a str, usize), 64>,
+    entry_point: usize,
+    has_thread_locals: bool,
+    is_dylib: bool,
+}
+
+/// Dynamically link the program.
 ///
-/// This function performs the full dynamic linking of the program.
-/// Once this returns, we can safely jump to its entrypoint without
-/// troubles
+/// On return the image has been mapped, fixed up, and its initializers
+/// have run; jumping to the returned address enters the program safely.
 pub fn dynamically_link(
     dyld_shared_cache: &DyldSharedCache<'_>,
-    program_header: *mut u8,
-    program_size: usize,
+    image: Container<'_>,
 ) -> Result<u64, &'static str> {
-    let mut segments = ArrayVec::<Segment, 64>::new_array();
-    let mut fixups = Vec::new();
-    let mut symbols = Vec::new();
-    let mut init_functions = ArrayVec::<usize, 64>::new_array();
-    let mut libraries = ArrayVec::<(&str, usize), 64>::new_array();
-    let mut has_thread_locals = false;
+    let parsed = parse_image(&image)?;
+    let (vm, _vm_size) = map_segments(&image, &parsed.segments)?;
 
-    let mut is_dylib = false;
-    let mut offset = size_of::<mach_header_64>();
-    let mut entry_point = 0;
-
-    let magic = unsafe { ptr::read_unaligned(program_header as *const mach_magic) };
-    let image_container = arm64_container_create(&Container::with_bytes(
-        unsafe { core::slice::from_raw_parts(program_header, program_size) },
-        macho_endian_from_magic(magic),
-    ))?;
-
-    let mach_header_64 {
-        filetype, ncmds, ..
-    } = image_container
-        .deserialize_type_at_offset::<mach_header_64>(0)
-        .map_err(|_| "could not read `mach_header_64` from arm64 image")?;
-
-    if !matches!(filetype, macho_filetype_variants::MH_EXECUTE) {
-        if matches!(filetype, macho_filetype_variants::MH_DYLIB) {
-            is_dylib = true;
-        } else {
-            return Err("the arm64 image filetype must be MH_EXECUTE");
-        }
-    }
-    for _ in 0..ncmds {
-        let load_command { cmd, cmdsize } = image_container
-            .deserialize_type_at_offset(offset)
-            .map_err(|_| "could not parse a load command in the inner arm64 image")?;
-
-        match cmd {
-            // DYLIB COMMANDS
-            load_command_variants::LC_LOAD_DYLIB
-            | load_command_variants::LC_LOAD_WEAK_DYLIB
-            | load_command_variants::LC_LAZY_LOAD_DYLIB => {
-                let dylib_command { dylib, .. } = image_container
-                    .deserialize_type_at_offset(offset)
-                    .map_err(|_| "could not parse a dylib_command in the inner arm64 image")?;
-
-                libraries.push((
-                    image_container
-                        .deserialize_string_at_offset(offset + dylib.name.offset as usize),
-                    dylib.name.offset as usize,
-                ));
-            }
-            load_command_variants::LC_MAIN => {
-                if is_dylib {
-                    return Err("a dynamic library should not contain a `LC_MAIN` load command");
-                }
-
-                let entry_point_command { entryoff, .. } =
-                    image_container.deserialize_type_at_offset(offset).map_err(
-                        |_| "could not parse `entry_point_command` in the inner arm64 image",
-                    )?;
-
-                entry_point = entryoff as usize;
-            }
-            // SYMTAB COMMAND
-            load_command_variants::LC_SYMTAB => {
-                let symtab_command {
-                    symoff,
-                    nsyms,
-                    stroff,
-                    ..
-                } = image_container
-                    .deserialize_type_at_offset(offset)
-                    .map_err(|_| "could not parse `symtab_command` in the inner arm64 image")?;
-
-                let mut nlist_offset = symoff as usize;
-
-                for _ in 0..nsyms {
-                    let nlist_64 {
-                        n_un,
-                        n_type,
-                        n_value,
-                        n_desc,
-                        n_sect,
-                    } = image_container
-                        .deserialize_type_at_offset(nlist_offset)
-                        .map_err(|_| "could not parse `nlist_64` in the inner arm64 image")?;
-
-                    if n_type & N_STAB != 0 {
-                        // don't care about debug symbols
-                        continue;
-                    }
-
-                    match n_type & N_TYPE {
-                        N_SECT => {
-                            if (n_type & N_EXT) == 0 {
-                                if n_desc & N_ALT_ENTRY != 0 {
-                                    if n_type & N_PEXT != 0 {
-                                        return Err(
-                                            "unsupported makeAltEntry with Scope::wasLinkageUnit",
-                                        );
-                                    } else {
-                                        return Err("makeAltEntry with Scope::translationUnit");
-                                    }
-                                } else if n_type & N_PEXT != 0 {
-                                    if n_desc & N_WEAK_DEF != 0 {
-                                        return Err("makeWeakDefWasPrivateExtern");
-                                    } else {
-                                        symbols.push(Symbol::make_regular_export(
-                                            ArrayString::try_from_str(
-                                                image_container.deserialize_string_at_offset(
-                                                    (stroff + n_un.n_strx) as usize,
-                                                ),
-                                            )
-                                            .ok_or_else(|| "could not make_regular_export")?,
-                                            n_value as usize,
-                                            n_sect,
-                                            (n_desc & N_COLD_FUNC) != 0,
-                                            (n_desc & N_ARM_THUMB_DEF) != 0,
-                                        ))
-                                    }
-                                } else {
-                                    symbols.push(Symbol::make_regular_local(
-                                        ArrayString::try_from_str(
-                                            image_container.deserialize_string_at_offset(
-                                                (stroff + n_un.n_strx) as usize,
-                                            ),
-                                        )
-                                        .ok_or_else(|| "could not make_regular_local")?,
-                                        n_value as usize,
-                                        n_sect,
-                                        (n_desc & N_COLD_FUNC) != 0,
-                                        (n_desc & N_ARM_THUMB_DEF) != 0,
-                                    ))
-                                }
-                            } else if n_type & N_PEXT != 0 {
-                                if n_desc & N_ALT_ENTRY != 0 {
-                                    return Err("makeAltEntry with Scope::linkageUnit");
-                                } else if n_desc & N_WEAK_DEF != 0 {
-                                    return Err("makeWeakDefHidden");
-                                } else if n_desc & N_SYMBOL_RESOLVER != 0 {
-                                    return Err("makeDynamicResolver with Scope::linkageUnit");
-                                } else {
-                                    return Err("makeRegularHidden");
-                                }
-                            } else if n_desc & N_ALT_ENTRY != 0 {
-                                return Err("makeAltEntry with Scope::global");
-                            } else if (n_desc & (N_WEAK_DEF | N_WEAK_REF))
-                                == (N_WEAK_DEF | N_WEAK_REF)
-                            {
-                                return Err("makeWeakDefAutoHide");
-                            } else if n_desc & N_WEAK_DEF != 0 {
-                                symbols.push(Symbol::make_weak_def_export(
-                                    ArrayString::try_from_str(
-                                        image_container.deserialize_string_at_offset(
-                                            (stroff + n_un.n_strx) as usize,
-                                        ),
-                                    )
-                                    .ok_or_else(|| "could not make_weak_def_export")?,
-                                    n_value as usize,
-                                    n_sect,
-                                    (n_desc & N_COLD_FUNC) != 0,
-                                    (n_desc & N_ARM_THUMB_DEF) != 0,
-                                ))
-                            } else if n_desc & N_SYMBOL_RESOLVER != 0 {
-                                return Err("makeDynamicResolver");
-                            } else {
-                                symbols.push(Symbol::make_regular_export(
-                                    ArrayString::try_from_str(
-                                        image_container.deserialize_string_at_offset(
-                                            (stroff + n_un.n_strx) as usize,
-                                        ),
-                                    )
-                                    .ok_or_else(|| "could not make_regular_export")?,
-                                    n_value as usize,
-                                    n_sect,
-                                    (n_desc & N_COLD_FUNC) != 0,
-                                    (n_desc & N_ARM_THUMB_DEF) != 0,
-                                ))
-                            }
-                        }
-                        N_UNDF => {
-                            if n_value == 0 {
-                                symbols.push(Symbol::make_undefined(
-                                    ArrayString::try_from_str(
-                                        image_container.deserialize_string_at_offset(
-                                            (stroff + n_un.n_strx) as usize,
-                                        ),
-                                    )
-                                    .ok_or_else(|| "could not make_regular_export")?,
-                                    get_library_ordinal(n_desc),
-                                    (n_desc & N_WEAK_REF) != 0,
-                                ))
-                            } else if n_type & N_PEXT != 0 {
-                                unimplemented!("N_PEXT: n_type: {}", n_type & N_TYPE)
-                            } else {
-                                unimplemented!("n_type: {}", n_type & N_TYPE)
-                            }
-                        }
-                        _ =>
-                        /*println!("[warning]: ignoring n_type: {}", n_type & N_TYPE)*/
-                        {
-                            ()
-                        }
-                    }
-                    nlist_offset += size_of::<nlist_64>();
-                }
-            }
-            // SEGMENT COMMAND
-            load_command_variants::LC_SEGMENT_64 => {
-                let segment_command_64 {
-                    initprot,
-                    vmaddr: vm_addr,
-                    vmsize: vm_size,
-                    fileoff: file_off,
-                    segname,
-                    nsects,
-                    ..
-                } = image_container
-                    .deserialize_type_at_offset(offset)
-                    .map_err(|_| "could not parse `segment_command_64` in the inner arm64 image")?;
-
-                if segname.as_ref().starts_with(SEG_TEXT.as_ref()) {
-                    for sect_index in 0..nsects {
-                        let section_64 {
-                            flags,
-                            mut offset,
-                            size: sect_size,
-                            ..
-                        } = image_container
-                            .deserialize_type_at_offset(
-                                offset
-                                    + size_of::<segment_command_64>()
-                                    + sect_index as usize * size_of::<section_64>(),
-                            )
-                            .map_err(
-                                |_| "could not parse `segment_command_64` in the inner arm64 image",
-                            )?;
-
-                        if (flags & SECTION_TYPE) == S_INIT_FUNC_OFFSETS {
-                            let func_end_offset = offset + sect_size as u32;
-                            while offset < func_end_offset {
-                                init_functions.push(
-                                    image_container
-                                        .deserialize_type_at_offset::<u32>(offset as usize)
-                                        .map_err(|_| "could not parse S_INIT_FUNC_OFFSETS")?
-                                        as usize,
-                                );
-
-                                offset += size_of::<u32>() as u32;
-                            }
-                        } else {
-                            //println_err!("[warning] ignoring {} section", section_type_name(flags));
-                        }
-                    }
-                } else if segname.as_ref().starts_with(SEG_DATA.as_ref()) {
-                    for sect_index in 0..nsects {
-                        let section_64 {
-                            flags,
-                            offset: mut start_off,
-                            size: sect_size,
-                            ..
-                        } = image_container
-                            .deserialize_type_at_offset(
-                                offset
-                                    + size_of::<segment_command_64>()
-                                    + sect_index as usize * size_of::<section_64>(),
-                            )
-                            .map_err(
-                                |_| "could not parse `segment_command_64` in the inner arm64 image",
-                            )?;
-
-                        match flags & SECTION_TYPE {
-                            S_THREAD_LOCAL_VARIABLES => {
-                                has_thread_locals = true;
-                            }
-                            S_INIT_FUNC_OFFSETS => {
-                                let func_end_offset = start_off + sect_size as u32;
-                                while start_off < func_end_offset {
-                                    init_functions.push(
-                                        image_container
-                                            .deserialize_type_at_offset::<u32>(offset as usize)
-                                            .map_err(|_| "could not parse S_INIT_FUNC_OFFSETS")?
-                                            as usize,
-                                    );
-
-                                    start_off += size_of::<u32>() as u32;
-                                }
-                            }
-                            _ => {
-                                //println_err!(
-                                //    "[warning] ignoring {} section",
-                                //    section_type_name(flags)
-                                //);
-                            }
-                        }
-                    }
-                }
-
-                segments.push(Segment {
-                    prot: initprot,
-                    vm_addr,
-                    file_offset: file_off as usize,
-                    vm_size: vm_size as usize,
-                });
-            }
-            // CHAINED FIXUPS COMMAND
-            load_command_variants::LC_DYLD_CHAINED_FIXUPS => {
-                fixups = Image::with_container(&image_container).chained_fixups_parse_all()?;
-            }
-
-            command if command & LC_REQ_DYLD == 0 => {
-                //println_err!("[warning] ignoring LC_REQ_DYLD load command: {command:?}");
-            }
-            _ => {}
-        }
-        offset += cmdsize as usize;
-    }
-
-    let (min_addr, max_addr) = segments
-        .iter()
-        .map(
-            |Segment {
-                 vm_addr, vm_size, ..
-             }| { (vm_addr, *vm_addr + *vm_size as u64) },
-        )
-        .fold((u64::MAX, 0), |(min, max), (start, end)| {
-            (min.min(*start), max.max(end))
-        });
-
-    let vm_size = (max_addr - min_addr) as usize;
-    let vm = mach::vm_alloc_task_self(vm_size).map_err(|_| "failed to vm_alloc_task_self")?;
-
-    for Segment {
-        vm_addr,
-        vm_size,
-        file_offset,
-        ..
-    } in &segments
-    {
-        if *vm_addr == 0 {
-            continue;
-        }
-
-        unsafe {
-            mach::vm_copy_into_task_self(
-                image_container.as_bytes().as_ptr().add(*file_offset).addr() as u64,
-                vm.add(*vm_addr as usize).as_ptr().addr() as u64,
-                *vm_size,
-            );
-        }
-    }
-
-    let mut loaded_dylibs = ArrayVec::<&str, 32>::new_array();
-    for (dylib_name, _) in libraries {
-        loaded_dylibs.push(dylib_name);
+    let mut loaded_dylibs: ArrayVec<&str, 32> = ArrayVec::new_array();
+    for (lib_name, _) in parsed.libraries {
+        loaded_dylibs.push(lib_name);
     }
 
     fixup_all_chained_fixups(
         vm.as_ptr() as *mut u8,
         PAGE_ZERO_SIZE,
-        &fixups,
-        &symbols,
+        &parsed.fixups,
+        &parsed.symbols,
         &loaded_dylibs,
         Some(dyld_shared_cache),
         false,
     )?;
 
+    apply_segment_protections(vm, &parsed.segments)?;
+    run_initializers(vm, &parsed.init_functions);
+
     unsafe {
-        for Segment {
-            vm_addr,
-            vm_size,
-            prot,
-            ..
-        } in &segments
-        {
-            [false, true].into_iter().for_each(|max| {
-                mach::vm_protect(
-                    vm.add(*vm_addr as usize).as_ptr().addr() as u64,
-                    *vm_size,
-                    max as u32,
-                    *prot as i32,
-                )
-                .map_err(|_| "could not apply vm protections to a memory region")
-                // fix ts
-                .unwrap()
-            });
+        Ok(vm
+            .add(parsed.entry_point)
+            .add(PAGE_ZERO_SIZE)
+            .as_ptr()
+            .addr() as u64)
+    }
+}
+
+/// Walk every load command once and gather everything we need to link.
+fn parse_image<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'static str> {
+    let mut parsed = ParsedImage {
+        segments: ArrayVec::new_array(),
+        fixups: Vec::new(),
+        symbols: Vec::new(),
+        init_functions: Vec::new(),
+        libraries: ArrayVec::new_array(),
+        entry_point: 0,
+        has_thread_locals: false,
+        is_dylib: false,
+    };
+
+    let mach_header_64 {
+        filetype, ncmds, ..
+    } = image
+        .deserialize_type_at_offset::<mach_header_64>(0)
+        .map_err(|_| "could not read `mach_header_64` from arm64 image")?;
+
+    parsed.is_dylib = match filetype {
+        macho_filetype_variants::MH_EXECUTE => false,
+        macho_filetype_variants::MH_DYLIB => true,
+        _ => return Err("the arm64 image filetype must be MH_EXECUTE"),
+    };
+
+    let mut offset = size_of::<mach_header_64>();
+    for _ in 0..ncmds {
+        let load_command { cmd, cmdsize } = image
+            .deserialize_type_at_offset(offset)
+            .map_err(|_| "could not parse a load command in the inner arm64 image")?;
+
+        match cmd {
+            load_command_variants::LC_LOAD_DYLIB
+            | load_command_variants::LC_LOAD_WEAK_DYLIB
+            | load_command_variants::LC_LAZY_LOAD_DYLIB => {
+                parse_dylib_command(image, offset, &mut parsed.libraries)?;
+            }
+            load_command_variants::LC_MAIN => {
+                parsed.entry_point = parse_main_command(image, offset, parsed.is_dylib)?;
+            }
+            load_command_variants::LC_SYMTAB => {
+                parse_symtab(image, offset, &mut parsed.symbols)?;
+            }
+            load_command_variants::LC_SEGMENT_64 => {
+                parse_segment(
+                    image,
+                    offset,
+                    &mut parsed.segments,
+                    &mut parsed.init_functions,
+                    &mut parsed.has_thread_locals,
+                )?;
+            }
+            load_command_variants::LC_DYLD_CHAINED_FIXUPS => {
+                parsed.fixups = Image::with_container(image).chained_fixups_parse_all()?;
+            }
+            // Unknown but tolerated: only LC_REQ_DYLD commands are required to be understood.
+            command if command & LC_REQ_DYLD == 0 => {}
+            _ => {}
+        }
+
+        offset += cmdsize as usize;
+    }
+
+    Ok(parsed)
+}
+
+fn parse_dylib_command<'a>(
+    image: &'a Container<'a>,
+    offset: usize,
+    libraries: &mut ArrayVec<(&'a str, usize), 64>,
+) -> Result<(), &'static str> {
+    let dylib_command { dylib, .. } = image
+        .deserialize_type_at_offset(offset)
+        .map_err(|_| "could not parse a dylib_command in the inner arm64 image")?;
+
+    let name_offset = offset + dylib.name.offset as usize;
+    libraries.push((
+        image.deserialize_string_at_offset(name_offset),
+        dylib.name.offset as usize,
+    ));
+    Ok(())
+}
+
+fn parse_main_command(
+    image: &Container<'_>,
+    offset: usize,
+    is_dylib: bool,
+) -> Result<usize, &'static str> {
+    if is_dylib {
+        return Err("a dynamic library should not contain a `LC_MAIN` load command");
+    }
+    let entry_point_command { entryoff, .. } = image
+        .deserialize_type_at_offset(offset)
+        .map_err(|_| "could not parse `entry_point_command` in the inner arm64 image")?;
+    Ok(entryoff as usize)
+}
+
+/// Parse the symbol table, classifying each entry into a Symbol variant
+/// or rejecting symbol shapes the linker doesn't (yet) support.
+fn parse_symtab(
+    image: &Container<'_>,
+    offset: usize,
+    symbols: &mut Vec<Symbol>,
+) -> Result<(), &'static str> {
+    let symtab_command {
+        symoff,
+        nsyms,
+        stroff,
+        ..
+    } = image
+        .deserialize_type_at_offset(offset)
+        .map_err(|_| "could not parse `symtab_command` in the inner arm64 image")?;
+
+    let mut nlist_offset = symoff as usize;
+    for _ in 0..nsyms {
+        let entry: nlist_64 = image
+            .deserialize_type_at_offset(nlist_offset)
+            .map_err(|_| "could not parse `nlist_64` in the inner arm64 image")?;
+        nlist_offset += size_of::<nlist_64>();
+
+        // Debug symbols carry no linkage information.
+        if entry.n_type & N_STAB != 0 {
+            continue;
+        }
+
+        match entry.n_type & N_TYPE {
+            N_SECT => classify_defined_symbol(image, stroff, &entry, symbols)?,
+            N_UNDF => classify_undefined_symbol(image, stroff, &entry, symbols)?,
+            _ => {} // ignore N_ABS, N_PBUD, N_INDR
+        }
+    }
+    Ok(())
+}
+
+/// Decode an N_SECT entry. The combination of N_EXT / N_PEXT / N_WEAK_DEF /
+/// N_ALT_ENTRY / N_SYMBOL_RESOLVER encodes the symbol's scope and kind;
+/// only the shapes ld64 actually emits for linkable output are accepted.
+fn classify_defined_symbol(
+    image: &Container<'_>,
+    stroff: u32,
+    entry: &nlist_64,
+    symbols: &mut Vec<Symbol>,
+) -> Result<(), &'static str> {
+    let name = read_symbol_name(
+        image,
+        stroff,
+        entry.n_un.n_strx,
+        "could not read symbol name",
+    )?;
+    let value = entry.n_value as usize;
+    let sect = entry.n_sect;
+    let cold = (entry.n_desc & N_COLD_FUNC) != 0;
+    let thumb = (entry.n_desc & N_ARM_THUMB_DEF) != 0;
+
+    let is_external = entry.n_type & N_EXT != 0;
+    let is_private_extern = entry.n_type & N_PEXT != 0;
+    let is_weak_def = entry.n_desc & N_WEAK_DEF != 0;
+    let is_alt_entry = entry.n_desc & N_ALT_ENTRY != 0;
+    let is_resolver = entry.n_desc & N_SYMBOL_RESOLVER != 0;
+
+    match (
+        is_external,
+        is_private_extern,
+        is_weak_def,
+        is_alt_entry,
+        is_resolver,
+    ) {
+        // translation unit local
+        (false, false, false, false, _) => {
+            symbols.push(Symbol::make_regular_local(name, value, sect, cold, thumb));
+        }
+        // private extern: linkage unit scoped export
+        (false, true, false, false, _) => {
+            symbols.push(Symbol::make_regular_export(name, value, sect, cold, thumb));
+        }
+        // global weak def
+        (true, false, true, false, _) if entry.n_desc & N_WEAK_REF == 0 => {
+            symbols.push(Symbol::make_weak_def_export(name, value, sect, cold, thumb));
+        }
+        // global regular export
+        (true, false, false, false, false) => {
+            symbols.push(Symbol::make_regular_export(name, value, sect, cold, thumb));
+        }
+
+        // these are things we recognize but not yet implement
+        (false, false, _, true, _) => Err("makeAltEntry with Scope::translationUnit")?,
+        (false, true, true, _, _) => Err("makeWeakDefWasPrivateExtern")?,
+        (false, true, false, true, _) => {
+            Err("unsupported makeAltEntry with Scope::wasLinkageUnit")?
+        }
+        (true, true, _, true, _) => Err("makeAltEntry with Scope::linkageUnit")?,
+        (true, true, true, _, _) => Err("makeWeakDefHidden")?,
+        (true, true, _, _, true) => Err("makeDynamicResolver with Scope::linkageUnit")?,
+        (true, true, _, _, _) => Err("makeRegularHidden")?,
+        (true, false, _, true, _) => Err("makeAltEntry with Scope::global")?,
+        (true, false, true, _, _) => Err("makeWeakDefAutoHide")?, // N_WEAK_DEF | N_WEAK_REF
+        (true, false, _, _, true) => Err("makeDynamicResolver")?,
+        _ => Err("unknown symbol kind")?,
+    }
+    Ok(())
+}
+
+fn classify_undefined_symbol(
+    image: &Container<'_>,
+    stroff: u32,
+    entry: &nlist_64,
+    symbols: &mut Vec<Symbol>,
+) -> Result<(), &'static str> {
+    if entry.n_value != 0 {
+        if entry.n_type & N_PEXT != 0 {
+            unimplemented!("N_PEXT: n_type: {}", entry.n_type & N_TYPE);
+        }
+        unimplemented!("n_type: {}", entry.n_type & N_TYPE);
+    }
+
+    let name = read_symbol_name(
+        image,
+        stroff,
+        entry.n_un.n_strx,
+        "could not read symbol name",
+    )?;
+    symbols.push(Symbol::make_undefined(
+        name,
+        get_library_ordinal(entry.n_desc),
+        (entry.n_desc & N_WEAK_REF) != 0,
+    ));
+    Ok(())
+}
+
+fn read_symbol_name(
+    image: &Container<'_>,
+    stroff: u32,
+    n_strx: u32,
+    err: &'static str,
+) -> Result<ArrayString<SYMBOL_NAME_LEN>, &'static str> {
+    ArrayString::try_from_str(image.deserialize_string_at_offset((stroff + n_strx) as usize))
+        .ok_or(err)
+}
+
+/// Parse one LC_SEGMENT_64. Records the segment for later mapping and,
+/// for __TEXT and __DATA, walks sections to collect initializer offsets
+/// and note thread-local storage
+fn parse_segment(
+    image: &Container<'_>,
+    offset: usize,
+    segments: &mut ArrayVec<Segment, 64>,
+    init_functions: &mut Vec<usize>,
+    has_thread_locals: &mut bool,
+) -> Result<(), &'static str> {
+    let segment_command_64 {
+        initprot,
+        vmaddr,
+        vmsize,
+        fileoff,
+        segname,
+        nsects,
+        ..
+    } = image
+        .deserialize_type_at_offset(offset)
+        .map_err(|_| "could not parse `segment_command_64` in the inner arm64 image")?;
+
+    let sections_off = offset + size_of::<segment_command_64>();
+
+    if segname.as_ref().starts_with(SEG_TEXT.as_ref())
+        || segname.as_ref().starts_with(SEG_DATA.as_ref())
+    {
+        for i in 0..nsects {
+            let section_off = sections_off + i as usize * size_of::<section_64>();
+            scan_section(image, section_off, init_functions, has_thread_locals)?;
         }
     }
 
-    //dyld_shared_cache.vm_protect_executable().unwrap();
-
-    Ok(unsafe { vm.add(entry_point).add(PAGE_ZERO_SIZE).as_ptr().addr() as u64 })
+    segments.push(Segment {
+        prot: initprot,
+        vm_addr: vmaddr,
+        file_offset: fileoff as usize,
+        vm_size: vmsize as usize,
+    });
+    Ok(())
 }
 
-/// Tries to find an image with a `CPU_TYPE_ARM64` cputype
-///
-/// If the container is a fat_magic image, we try to find
-/// the correct architecture within it
-fn arm64_container_create<'bytes>(
-    image_container: &Container<'bytes>,
-) -> Result<Container<'bytes>, &'static str> {
-    let header = image_container
-        .deserialize_type_at_offset::<mach_header_64>(0)
-        .unwrap();
+/// Read one section header and pick out the bits the linker cares about:
+/// init-function offset tables and the thread-locals marker.
+fn scan_section(
+    image: &Container<'_>,
+    section_off: usize,
+    init_functions: &mut Vec<usize>,
+    has_thread_locals: &mut bool,
+) -> Result<(), &'static str> {
+    let section_64 {
+        flags,
+        offset,
+        size,
+        ..
+    } = image
+        .deserialize_type_at_offset(section_off)
+        .map_err(|_| "could not parse `section_64` in the inner arm64 image")?;
 
-    // if the image already has a CPU_TYPE_ARM64 cputype,
-    // we can return it
-    if header.magic == mach_magic::MH_MAGIC_64 && header.cputype == CPU_TYPE_ARM64 {
-        return Ok(*image_container);
+    match flags & SECTION_TYPE {
+        S_INIT_FUNC_OFFSETS => read_init_func_offsets(image, offset, size as u32, init_functions)?,
+        S_THREAD_LOCAL_VARIABLES => *has_thread_locals = true,
+        _ => {} // other section types are not relevant to dynamic linking here
     }
+    Ok(())
+}
 
-    // if this is not a fat binary and is not a CPU_TYPE_ARM64,
-    // we return an error
-    if header.magic != mach_magic::FAT_MAGIC {
-        return Err("Not a valid ARM64 Mach-O or fat binary");
+/// An S_INIT_FUNC_OFFSETS section is a flat array of u32 offsets-from-base
+/// pointing at functions to run before main.
+fn read_init_func_offsets(
+    image: &Container<'_>,
+    mut cursor: u32,
+    size: u32,
+    init_functions: &mut Vec<usize>,
+) -> Result<(), &'static str> {
+    let end = cursor + size;
+    while cursor < end {
+        let func: u32 = image
+            .deserialize_type_at_offset(cursor as usize)
+            .map_err(|_| "could not parse S_INIT_FUNC_OFFSETS")?;
+        init_functions.push(func as usize);
+        cursor += size_of::<u32>() as u32;
     }
+    Ok(())
+}
 
-    let fat_header = image_container
-        .deserialize_type_at_offset::<fat_header>(0)
-        .unwrap();
-    (0..fat_header.nfat_arch)
-        .filter_map(|index| {
-            let offset = size_of::<fat_header>() + index as usize * size_of::<fat_arch>();
+/// Allocate a single VM region covering every segment, then copy each
+/// segment's file bytes into its assigned slot.
+fn map_segments(
+    image: &Container<'_>,
+    segments: &[Segment],
+) -> Result<(NonNull<u8>, usize), &'static str> {
+    let (min_addr, max_addr) = segments
+        .iter()
+        .map(|s| (s.vm_addr, s.vm_addr + s.vm_size as u64))
+        .fold((u64::MAX, 0u64), |(lo, hi), (s, e)| (lo.min(s), hi.max(e)));
 
-            let fat_arch { offset, size, .. } = image_container
-                .deserialize_type_at_offset::<fat_arch>(offset)
-                .ok()?;
+    let vm_size = (max_addr - min_addr) as usize;
+    let vm = mach::vm_alloc_task_self(vm_size).map_err(|_| "failed to vm_alloc_task_self")?;
 
-            image_container
-                .slice(offset as usize, size as usize)
-                .map(|bytes| {
-                    Container::with_bytes(
-                        bytes,
-                        macho_endian_from_magic(unsafe {
-                            ptr::read_unaligned(bytes.as_ptr() as *const mach_magic)
-                        }),
-                    )
-                })
-        })
-        .find(|container| {
-            container
-                .deserialize_type_at_offset::<mach_header_64>(0)
-                .map(|h| h.magic == mach_magic::MH_MAGIC_64 && h.cputype == CPU_TYPE_ARM64)
-                .unwrap_or(false)
-        })
-        .map(|container| arm64_container_create(&container))
-        .ok_or_else(|| "error: could not read `mach_header_64` from inner mach-o")?
+    for seg in segments {
+        // __PAGEZERO has vm_addr == 0 and no file backing; skip it.
+        if seg.vm_addr == 0 {
+            continue;
+        }
+        unsafe {
+            mach::vm_copy_into_task_self(
+                image.as_bytes().as_ptr().add(seg.file_offset).addr() as u64,
+                vm.add(seg.vm_addr as usize).as_ptr().addr() as u64,
+                seg.vm_size,
+            );
+        }
+    }
+    Ok((vm, vm_size))
+}
+
+/// Apply each segment's permissions. We set max-protection first, then the
+/// current protection, because the current one cannot exceed max.
+fn apply_segment_protections(vm: NonNull<u8>, segments: &[Segment]) -> Result<(), &'static str> {
+    for seg in segments {
+        for set_max in [true, false] {
+            unsafe {
+                mach::vm_protect(
+                    vm.add(seg.vm_addr as usize).as_ptr().addr() as u64,
+                    seg.vm_size,
+                    set_max as u32,
+                    seg.prot as i32,
+                )
+                .map_err(|_| "could not apply vm protections to a memory region")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Call every initializer collected from S_INIT_FUNC_OFFSETS, in order.
+fn run_initializers(vm: NonNull<u8>, init_functions: &[usize]) {
+    for &func in init_functions {
+        unsafe {
+            jump::entry_and_ret(
+                vm.add(func).add(PAGE_ZERO_SIZE),
+                0,
+                [core::ptr::null()].as_ptr(),
+                [core::ptr::null()].as_ptr(),
+            );
+        }
+    }
 }
