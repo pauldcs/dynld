@@ -1,7 +1,5 @@
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
-//#![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::{
     allocator::{Allocator, VM},
@@ -133,19 +131,21 @@ fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -
             if !fixups.is_empty() {
                 // unwrap if this does not work, we might want to return
                 // a proper error instead though
-                fixup_all_chained_fixups(
-                    self_header,
-                    0,
-                    &fixups,
-                    &Vec::new(),
-                    &ArrayVec::new_array(),
-                    None,
-                    true,
-                )
-                .map_err(|_| {
-                    let _ = libc::write(STDERR_FILENO, b"self rebase error, exiting ...\n");
-                    exit_error()
-                });
+                unsafe {
+                    fixup_all_chained_fixups(
+                        self_header,
+                        0,
+                        &fixups,
+                        &Vec::new(),
+                        &ArrayVec::new_array(),
+                        None,
+                        true,
+                    )
+                    .map_err(|_| {
+                        let _ = libc::write(STDERR_FILENO, b"self rebase error, exiting ...\n");
+                        exit_error()
+                    })
+                };
             };
             // we return the bind fixups, as we cannot handle them right now. We first need to load
             // the shared cache first

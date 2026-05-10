@@ -110,7 +110,7 @@ impl<'bytes> Image<'bytes> {
             next_load_command_offset += cmdsize as usize;
         }
 
-        return if contains_fixups_header {
+        if contains_fixups_header {
             // a LC_DYLD_CHAINED_FIXUPS is a linkedit_data_command. We need to extract `dataoff` from
             // it. This will tell us where the `dyld_chained_fixups_header` is located at
             let linkedit_data_command { dataoff, .. } = self
@@ -126,7 +126,7 @@ impl<'bytes> Image<'bytes> {
             )))
         } else {
             Ok(None)
-        };
+        }
     }
 
     /// Applies all fixups to the image
@@ -474,7 +474,7 @@ impl<'bytes> Image<'bytes> {
     }
 }
 
-pub fn fixup_all_chained_fixups(
+pub unsafe fn fixup_all_chained_fixups(
     dst_ptr: *mut u8,
     page_zero_size: usize,
     fixups: &Vec<Fixup>,
@@ -522,7 +522,7 @@ pub fn fixup_all_chained_fixups(
                         let symbol = symbols
                             .iter()
                             .find(|sym| sym.array_string_cmp(symbol_name))
-                            .ok_or_else(|| "could not find a matching symbol while fixing up a BIND_SPECIAL_DYLIB_WEAK_LOOKUP")?;
+                            .ok_or("could not find a matching symbol while fixing up a BIND_SPECIAL_DYLIB_WEAK_LOOKUP")?;
 
                         *dst_addr = (dst_ptr.add(symbol.impl_offset).addr()) as u64;
                     },

@@ -61,15 +61,17 @@ pub fn dynamically_link(
         loaded_dylibs.push(lib_name);
     }
 
-    fixup_all_chained_fixups(
-        vm.as_ptr() as *mut u8,
-        PAGE_ZERO_SIZE,
-        &parsed.fixups,
-        &parsed.symbols,
-        &loaded_dylibs,
-        Some(dyld_shared_cache),
-        false,
-    )?;
+    unsafe {
+        fixup_all_chained_fixups(
+            vm.as_ptr() as *mut u8,
+            PAGE_ZERO_SIZE,
+            &parsed.fixups,
+            &parsed.symbols,
+            &loaded_dylibs,
+            Some(dyld_shared_cache),
+            false,
+        )?
+    };
 
     apply_segment_protections(vm, &parsed.segments)?;
     run_initializers(vm, &parsed.init_functions);
