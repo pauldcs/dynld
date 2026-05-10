@@ -64,7 +64,6 @@ $(NAME): $(SRCS_OBJS) dynld
 	$(MAKE) -C $(LIBDSC_DIR)
 	$(CC) $(filter-out dynld,$^) $(CFLAGS) \
 	    -I $(INCS_DIR) \
-			-Wl,-stack_size,0x10000000 \
 			-L$(LIBTLV_DIR) -ltlv \
 			-L$(LIBDSC_DIR) -ldsc \
 	    -o $(NAME)
