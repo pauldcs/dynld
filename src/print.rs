@@ -19,6 +19,7 @@ struct Stdout;
 struct Stderr;
 
 impl Write for Stdout {
+    #[allow(unused)]
     fn write_str(&mut self, s: &str) -> fmt::Result {
         write_all(STDOUT_FILENO, s.as_bytes()).map_err(|_| fmt::Error)
     }
@@ -71,24 +72,3 @@ macro_rules! println_err {
         $crate::print::_print_err(format_args!("\n"));
     }};
 }
-
-// pub const HEX: &str = "0123456789abcdef";
-// pub fn print_ptr(ptr: *const u8) {
-//     let mut buf = [0u8; 19]; // "0x" + 16 hex digits + "\n"
-//     buf[0] = b'0';
-//     buf[1] = b'x';
-
-//     let addr = ptr as usize;
-//     let hex = HEX.as_bytes();
-
-//     // Fill 16 hex digits, most-significant nibble first.
-//     let mut i = 0;
-//     while i < 16 {
-//         let shift = (15 - i) * 4;
-//         let nibble = (addr >> shift) & 0xf;
-//         buf[2 + i] = hex[nibble];
-//         i += 1;
-//     }
-
-//     let _ = write(2, &buf);
-// }

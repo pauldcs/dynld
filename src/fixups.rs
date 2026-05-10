@@ -55,7 +55,7 @@ pub enum FixupKind {
         /// the library ordinal of the symbol
         ordinal: u32,
         /// tells if the resolved pointer should be signed
-        is_auth: bool,
+        _is_auth: bool,
 
         #[allow(unused)]
         addend: i64,
@@ -83,7 +83,7 @@ impl Fixup {
             kind: FixupKind::Bind {
                 symbol_name,
                 ordinal,
-                is_auth,
+                _is_auth: is_auth,
                 addend,
             },
         }
@@ -288,7 +288,7 @@ impl<'bytes> Image<'bytes> {
                     offset,
                     kind: FixupKind::Bind {
                         symbol_name,
-                        is_auth: false,
+                        _is_auth: false,
                         ordinal: lib_ordinal as u32,
                         addend: bind_ptr.addend() as i64,
                     },

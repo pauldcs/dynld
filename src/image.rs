@@ -187,10 +187,7 @@ impl<'bytes> LCIterator<'bytes> {
 /// See <mach-o/loader.h>: `SECTION_TYPE` mask is `0x000000ff`.
 pub const SECTION_TYPE_MASK: u32 = 0x0000_00ff;
 
-/// Returns a static human-readable name for a Mach-O section type.
-///
-/// Pass either the raw 8-bit type or the full `flags` word — the function
-/// masks off the attribute bits itself.
+#[allow(unused)]
 pub fn section_type_name(flags: u32) -> &'static str {
     match flags & SECTION_TYPE_MASK {
         0x00 => "S_REGULAR",

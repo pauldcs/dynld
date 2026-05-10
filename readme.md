@@ -1,4 +1,4 @@
-# dynld: macOS/iOS Dynamic Linker
+# dynld: macOS Dynamic Linker
 
 Disclaimer: The XNU kernel does not allow you to decide on the dynamic linker you choose to run your programs with. Any dynamic linker declared via `LC_LOAD_DYLINKER` is checked by the kernel and must correspond to `/usr/lib/dyld`. I strongly advise against trying to see what happens if you replace it with another.
 

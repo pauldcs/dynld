@@ -154,6 +154,7 @@ pub enum macho_filetype_variants {
 /// Constants for the flags field of the mach_header
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Pread)]
+#[allow(unused)]
 pub enum macho_flags_variants {
     /// the object file has no undefined
     /// references

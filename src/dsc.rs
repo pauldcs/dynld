@@ -1,7 +1,5 @@
 //! Rust FFI bindings for `dyld_all_image_infos` and related dyld helpers.
 //!
-pub type mach_port_name_t = u32;
-pub type task_t = u32;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,7 +30,7 @@ pub struct user64_dyld_all_image_infos {
     pub sharedCacheBaseAddress: u64,
     pub timestamp: u64,
     pub dyldPath: u64,
-    pub notifyMachPorts: [mach_port_name_t; 8],
+    pub notifyMachPorts: [u32; 8],
     pub reserved: [u64; 9],
     pub compact_dyld_image_info_addr: u64,
     pub compact_dyld_image_info_size: u64,
@@ -51,6 +49,7 @@ unsafe extern "C" {
     /// `image_infos` must be a valid, writable pointer to a
     /// `user64_dyld_all_image_infos`. `task` must be a valid task port
     /// the caller has the right to introspect.
+    #[allow(unused)]
     pub fn dyld_all_image_infos_get(image_infos: *mut user64_dyld_all_image_infos) -> u8;
 
     /// Get the base address of the dyld shared cache for the current process.

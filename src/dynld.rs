@@ -85,7 +85,7 @@ pub fn dynamically_link(
     }
 }
 
-/// Walk every load command once and gather everything we need to link.
+/// Walk every load command once and gather everything we need to link
 fn parse_image<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'static str> {
     let mut parsed = ParsedImage {
         segments: ArrayVec::new_array(),
@@ -183,7 +183,7 @@ fn parse_main_command(
 }
 
 /// Parse the symbol table, classifying each entry into a Symbol variant
-/// or rejecting symbol shapes the linker doesn't (yet) support.
+/// or rejecting symbol shapes the linker doesn't yet support
 fn parse_symtab(
     image: &Container<'_>,
     offset: usize,
@@ -219,9 +219,7 @@ fn parse_symtab(
     Ok(())
 }
 
-/// Decode an N_SECT entry. The combination of N_EXT / N_PEXT / N_WEAK_DEF /
-/// N_ALT_ENTRY / N_SYMBOL_RESOLVER encodes the symbol's scope and kind;
-/// only the shapes ld64 actually emits for linkable output are accepted.
+/// Decode an N_SECT entry
 fn classify_defined_symbol(
     image: &Container<'_>,
     stroff: u32,
@@ -324,9 +322,7 @@ fn read_symbol_name(
         .ok_or(err)
 }
 
-/// Parse one LC_SEGMENT_64. Records the segment for later mapping and,
-/// for __TEXT and __DATA, walks sections to collect initializer offsets
-/// and note thread-local storage
+/// Parse one LC_SEGMENT_64
 fn parse_segment(
     image: &Container<'_>,
     offset: usize,
@@ -366,8 +362,7 @@ fn parse_segment(
     Ok(())
 }
 
-/// Read one section header and pick out the bits the linker cares about:
-/// init-function offset tables and the thread-locals marker.
+/// Read one section header and pick out the bits the linker cares about
 fn scan_section(
     image: &Container<'_>,
     section_off: usize,
@@ -386,13 +381,11 @@ fn scan_section(
     match flags & SECTION_TYPE {
         S_INIT_FUNC_OFFSETS => read_init_func_offsets(image, offset, size as u32, init_functions)?,
         S_THREAD_LOCAL_VARIABLES => *has_thread_locals = true,
-        _ => {} // other section types are not relevant to dynamic linking here
+        _ => {} // other section types are not relevant
     }
     Ok(())
 }
 
-/// An S_INIT_FUNC_OFFSETS section is a flat array of u32 offsets-from-base
-/// pointing at functions to run before main.
 fn read_init_func_offsets(
     image: &Container<'_>,
     mut cursor: u32,
@@ -411,7 +404,7 @@ fn read_init_func_offsets(
 }
 
 /// Allocate a single VM region covering every segment, then copy each
-/// segment's file bytes into its assigned slot.
+/// segment's file bytes into its assigned slot
 fn map_segments(
     image: &Container<'_>,
     segments: &[Segment],
@@ -425,7 +418,7 @@ fn map_segments(
     let vm = mach::vm_alloc_task_self(vm_size).map_err(|_| "failed to vm_alloc_task_self")?;
 
     for seg in segments {
-        // __PAGEZERO has vm_addr == 0 and no file backing; skip it.
+        // __PAGEZERO has vm_addr == 0
         if seg.vm_addr == 0 {
             continue;
         }

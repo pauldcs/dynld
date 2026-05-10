@@ -1,5 +1,6 @@
 use core::ptr::NonNull;
 
+#[allow(unused)]
 pub unsafe fn entry(
     entrypoint: NonNull<u8>,
     argc: usize,

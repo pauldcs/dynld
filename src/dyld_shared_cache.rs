@@ -16,7 +16,6 @@ use crate::{
         mach_header_64,
     },
     container,
-    dylib::DynamicLib,
 };
 
 // The dyld shared cache is a single, very large file (actually several files
@@ -164,18 +163,9 @@ pub struct SharedCacheLibrary<'image> {
     /// runtime memory.
     mach_header_runtime_offset: usize,
     /// Where the library came from.
-    lib: DynamicLib<'image>,
+    install_path: &'image str,
     /// The unslid VM address dyld would use as this image's load address.
     unslid_load_address: u64,
-}
-
-impl<'image> SharedCacheLibrary<'image> {
-    fn path_bytes_install(&self) -> Option<&[u8]> {
-        match &self.lib {
-            DynamicLib::Cached(path_string) => Some(path_string.as_bytes()),
-            _ => None,
-        }
-    }
 }
 
 /// A view bundling a library together with the subcache it
@@ -489,15 +479,13 @@ impl<'image> DyldSharedCache<'image> {
                 .runtime_offset_for_file_offset(path_file_offset as u64)
                 .ok_or("image path offset not covered by any mapping")?;
 
-            let install_path = main_cache
-                .deserialize_cstr_at_offset(path_runtime_offset)
-                .to_str()
-                .unwrap();
-
             self.libraries.push(SharedCacheLibrary {
                 sub_cache_index,
                 mach_header_runtime_offset,
-                lib: DynamicLib::Cached(install_path),
+                install_path: main_cache
+                    .deserialize_cstr_at_offset(path_runtime_offset)
+                    .to_str()
+                    .unwrap(),
                 unslid_load_address,
             });
         }
@@ -537,7 +525,7 @@ impl<'image> DyldSharedCache<'image> {
     ) -> Option<&SharedCacheLibrary<'image>> {
         self.libraries
             .iter()
-            .find(|lib| lib.path_bytes_install() == Some(install_path))
+            .find(|lib| lib.install_path.as_bytes() == install_path)
     }
 
     /// The public entry point. Given a library's install path (the same

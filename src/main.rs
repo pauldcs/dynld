@@ -17,43 +17,36 @@ use core::arch::global_asm;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// All modules are public to avoid all the unused functions errors
+#[allow(non_camel_case_types)]
+mod bindings_dsc;
 
 #[allow(non_camel_case_types)]
-pub mod bindings_dsc;
+#[allow(unused)] // some code is usused there but will become useful
+mod bindings_macho;
 
 #[allow(non_camel_case_types)]
-pub mod bindings_macho;
-
-#[allow(non_camel_case_types)]
-pub mod mach;
-
-#[allow(non_camel_case_types)]
-pub mod mmap;
+mod mach;
 
 #[allow(non_camel_case_types, non_snake_case)]
-pub mod dsc;
+mod dsc;
 
-pub mod allocator;
-pub mod array;
-pub mod container;
-pub mod dyld_shared_cache;
-pub mod dylib;
-pub mod dynld;
-pub mod entrypoint;
-pub mod fixups;
-pub mod image;
-pub mod jump;
-pub mod libc;
-pub mod print;
-pub mod ptrauth;
-pub mod syscalls;
-pub mod tlv;
+mod allocator;
+mod array;
+mod container;
+mod dyld_shared_cache;
+mod dynld;
+mod entrypoint;
+mod fixups;
+mod image;
+mod jump;
+mod libc;
+mod print;
+//mod ptrauth;
+mod syscalls;
+mod tlv;
 
 pub(crate) const PAGE_ZERO_SIZE: usize = 0x100000000;
 pub(crate) const SYMBOL_NAME_LEN: usize = 128;
-// pub(crate) const DYLD_SHARED_CACHE_PATH: &str =
-//     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e\0";
 
 global_asm!(include_str!("__dyld_start.s"));
 
@@ -64,9 +57,6 @@ static mut HAS_REBASED_SELF: bool = false;
 compile_error!("cuurently dynld only targets aarch64-apple-darwin");
 
 /// The panic handler
-///
-/// note that you cannot use println or anything that uses data pointers in
-/// this handler. This handler might be called before we were able to rebase ourselves
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     if unsafe { HAS_REBASED_SELF } {
