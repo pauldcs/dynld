@@ -4,13 +4,13 @@
 //#![deny(clippy::undocumented_unsafe_blocks)]
 
 use crate::{
+    allocator::{Allocator, VM},
     array::ArrayVec,
     bindings_macho::{mach_header_64, mach_magic},
     container::Container,
     dynld::macho_endian_from_magic,
     entrypoint::dynld_entrypoint,
-    fixups::fixup_all_chained_fixups,
-    heap::{Allocator, VM},
+    fixups::{Fixup, FixupKind, fixup_all_chained_fixups},
     image::Image,
     libc::{EXIT_FAILURE, STDERR_FILENO, exit_error},
 };
@@ -36,6 +36,7 @@ pub mod mmap;
 #[allow(non_camel_case_types, non_snake_case)]
 pub mod dsc;
 
+pub mod allocator;
 pub mod array;
 pub mod container;
 pub mod dyld_shared_cache;
@@ -43,15 +44,16 @@ pub mod dylib;
 pub mod dynld;
 pub mod entrypoint;
 pub mod fixups;
-pub mod heap;
 pub mod image;
 pub mod jump;
 pub mod libc;
 pub mod print;
+pub mod ptrauth;
 pub mod syscalls;
 pub mod tlv;
 
 pub(crate) const PAGE_ZERO_SIZE: usize = 0x100000000;
+pub(crate) const SYMBOL_NAME_LEN: usize = 128;
 // pub(crate) const DYLD_SHARED_CACHE_PATH: &str =
 //     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e\0";
 
@@ -116,7 +118,7 @@ pub struct Stack {
 /// This program cannot use any DATA pointers before this function is called as they need
 /// to be fixed-up first. Note that the segments of the dynamic linker image must have
 /// been protected with `vm_protect` with `VM_PROT_WRITE` before for this to work.
-fn rebase_self(self_header: *mut u8, self_size: usize) {
+fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -> Vec<Fixup> {
     // wrap the binary blob in a Container in order to be able to parse it
     let magic = unsafe { core::ptr::read_unaligned(self_header as *const mach_magic) };
     let dylinker_container = Container::with_bytes(
@@ -127,7 +129,7 @@ fn rebase_self(self_header: *mut u8, self_size: usize) {
     // try to parse the fixups, we need them to be able to repabase the
     // data pointers for things to work further down the road
     match Image::with_container(&dylinker_container).chained_fixups_parse_all() {
-        Ok(fixups) => {
+        Ok(mut fixups) => {
             if !fixups.is_empty() {
                 // unwrap if this does not work, we might want to return
                 // a proper error instead though
@@ -144,7 +146,12 @@ fn rebase_self(self_header: *mut u8, self_size: usize) {
                     let _ = libc::write(STDERR_FILENO, b"self rebase error, exiting ...\n");
                     exit_error()
                 });
-            }
+            };
+            // we return the bind fixups, as we cannot handle them right now. We first need to load
+            // the shared cache first
+            return fixups
+                .extract_if(.., |fixup| matches!(fixup.kind, FixupKind::Bind { .. }))
+                .collect();
         }
         Err(error) => {
             // we cannot use `println_err` here as we failed to rebase ourselves so we
@@ -179,10 +186,13 @@ pub unsafe extern "C" fn start(info: *const Stack) {
 
     // none of the data pointers in the current binary are valid before
     // this function has been executed.
-    rebase_self(*dylinker_header as *mut u8, *dylinker_size);
+    let self_bind_fixups =
+        rebase_self_and_extract_bind_fixups(*dylinker_header as *mut u8, *dylinker_size);
+
     unsafe { HAS_REBASED_SELF = true };
 
     dynld_entrypoint(
+        self_bind_fixups,
         *executable_header as *mut mach_header_64,
         *executable_size,
         *argc,
