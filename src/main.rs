@@ -46,7 +46,9 @@ mod syscalls;
 mod tlv;
 
 pub(crate) const PAGE_ZERO_SIZE: usize = 0x100000000;
+pub(crate) const DYLD_LIKELY_UNSLID_VM_ADDR: u64 = 0x180000000;
 pub(crate) const SYMBOL_NAME_LEN: usize = 128;
+pub(crate) const LIBSYSTEM_PATH: &str = "/usr/lib/libSystem.B.dylib";
 
 global_asm!(include_str!("__dyld_start.s"));
 
@@ -82,6 +84,7 @@ static ALLOC: Allocator = Allocator::new(VM);
 /// This struct gets passed as the first argument to the
 /// start function, called by the kernel.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct Stack {
     /// A pointer to the dynamic linkes own mach header
     pub dylinker_header: *const mach_header_64,
@@ -106,14 +109,7 @@ pub struct Stack {
 /// This program cannot use any DATA pointers before this function is called as they need
 /// to be fixed-up first. Note that the segments of the dynamic linker image must have
 /// been protected with `vm_protect` with `VM_PROT_WRITE` before for this to work.
-fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -> Vec<Fixup> {
-    // wrap the binary blob in a Container in order to be able to parse it
-    let magic = unsafe { core::ptr::read_unaligned(self_header as *const mach_magic) };
-    let dylinker_container = Container::with_bytes(
-        unsafe { core::slice::from_raw_parts(self_header, self_size) },
-        macho_endian_from_magic(magic),
-    );
-
+fn rebase_self_and_extract_bind_fixups(dylinker_container: &Container<'_>) -> Vec<Fixup> {
     // try to parse the fixups, we need them to be able to repabase the
     // data pointers for things to work further down the road
     match Image::with_container(&dylinker_container).chained_fixups_parse_all() {
@@ -123,7 +119,7 @@ fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -
                 // a proper error instead though
                 unsafe {
                     fixup_all_chained_fixups(
-                        self_header,
+                        dylinker_container.as_bytes().as_ptr() as *mut u8,
                         0,
                         &fixups,
                         &Vec::new(),
@@ -139,6 +135,7 @@ fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -
             };
             // we return the bind fixups, as we cannot handle them right now. We first need to load
             // the shared cache first
+
             return fixups
                 .extract_if(.., |fixup| matches!(fixup.kind, FixupKind::Bind { .. }))
                 .collect();
@@ -165,30 +162,39 @@ fn rebase_self_and_extract_bind_fixups(self_header: *mut u8, self_size: usize) -
 pub unsafe extern "C" fn start(info: *const Stack) {
     let Stack {
         dylinker_header,
-        dylinker_size,
         executable_header,
+        dylinker_size,
         executable_size,
         argc,
         argv,
         envp,
         apple,
-    } = unsafe { &*info };
+    } = unsafe { *info };
+
+    // wrap the binary blob in a Container in order to be able to parse it
+    let dylinker_mach_magic =
+        unsafe { core::ptr::read_unaligned(dylinker_header as *const mach_magic) };
+
+    let dylinker_container = Container::with_bytes(
+        unsafe { core::slice::from_raw_parts(dylinker_header as *const u8, dylinker_size) },
+        macho_endian_from_magic(dylinker_mach_magic),
+    );
 
     // none of the data pointers in the current binary are valid before
     // this function has been executed.
-    let self_bind_fixups =
-        rebase_self_and_extract_bind_fixups(*dylinker_header as *mut u8, *dylinker_size);
+    let self_bind_fixups = rebase_self_and_extract_bind_fixups(&dylinker_container);
 
     unsafe { HAS_REBASED_SELF = true };
 
     dynld_entrypoint(
         self_bind_fixups,
-        *executable_header as *mut mach_header_64,
-        *executable_size,
-        *argc,
-        *argv,
-        *envp,
-        *apple,
+        dylinker_container,
+        executable_header as *mut mach_header_64,
+        executable_size,
+        argc,
+        argv,
+        envp,
+        apple,
     );
 
     // unreachable

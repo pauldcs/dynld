@@ -38,6 +38,7 @@ pub struct Segment {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub enum ThreadLocalKind {
     Variable,
     Regular,
@@ -47,14 +48,14 @@ pub enum ThreadLocalKind {
 
 #[allow(unused)]
 pub struct Symbol {
-    lib_ordinal: u8,
+    pub lib_ordinal: u8,
     pub name: ArrayString<SYMBOL_NAME_LEN>,
     pub impl_offset: usize,
-    sect_num: u8,
-    value: usize,
-    is_weak: bool,
-    is_thumb: bool,
-    is_cold: bool,
+    pub sect_num: u8,
+    pub value: usize,
+    pub is_weak: bool,
+    pub is_thumb: bool,
+    pub is_cold: bool,
 }
 
 impl Symbol {
@@ -134,7 +135,7 @@ impl Symbol {
 }
 
 impl Symbol {
-    pub fn array_string_cmp(&self, array_string: &ArrayString<256>) -> bool {
+    pub fn array_string_cmp(&self, array_string: &ArrayString<SYMBOL_NAME_LEN>) -> bool {
         self.name.as_bytes() == array_string.as_bytes()
     }
 }

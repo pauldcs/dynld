@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::{
+    SYMBOL_NAME_LEN,
     array::{ArrayString, ArrayVec},
     bindings_macho::{
         BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE,
@@ -31,16 +32,16 @@ const PAGE_STARTS_OFFSET: u32 = 22;
 /// They replace LC_DYLD_INFO(_ONLY) since OSX 12 ans iOS 15.
 /// Their main purpose is to reduce launch time and make the binary overall
 /// more compact
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fixup {
     /// The offset of the fixup (within the image)
-    offset: usize,
+    pub offset: usize,
     /// The kind of the fixups
     pub kind: FixupKind,
 }
 
 /// The possible kinds for a Chained Fixup
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FixupKind {
     /// An offset that must be turned into a pointer.
     ///
@@ -51,11 +52,12 @@ pub enum FixupKind {
     /// this.
     Bind {
         /// the name of the symbol
-        symbol_name: ArrayString<256>,
+        symbol_name: ArrayString<SYMBOL_NAME_LEN>,
         /// the library ordinal of the symbol
         ordinal: u32,
         /// tells if the resolved pointer should be signed
-        _is_auth: bool,
+        #[allow(unused)]
+        is_auth: bool,
 
         #[allow(unused)]
         addend: i64,
@@ -73,7 +75,7 @@ impl Fixup {
     /// Created a new Chained Fixup of kind `Bind`
     pub fn bind(
         offset: usize,
-        symbol_name: ArrayString<256>,
+        symbol_name: ArrayString<SYMBOL_NAME_LEN>,
         ordinal: u32,
         addend: i64,
         is_auth: bool,
@@ -83,7 +85,7 @@ impl Fixup {
             kind: FixupKind::Bind {
                 symbol_name,
                 ordinal,
-                _is_auth: is_auth,
+                is_auth,
                 addend,
             },
         }
@@ -288,7 +290,7 @@ impl<'bytes> Image<'bytes> {
                     offset,
                     kind: FixupKind::Bind {
                         symbol_name,
-                        _is_auth: false,
+                        is_auth: false,
                         ordinal: lib_ordinal as u32,
                         addend: bind_ptr.addend() as i64,
                     },
@@ -434,7 +436,7 @@ impl<'bytes> Image<'bytes> {
         imports_format: dyld_chained_import_format_variants,
         imports_offset: u64,
         symbols_offset: u64,
-    ) -> Result<(u8, ArrayString<256>), &'static str> {
+    ) -> Result<(u8, ArrayString<SYMBOL_NAME_LEN>), &'static str> {
         let (lib_ordinal, name_offset) = match imports_format {
             dyld_chained_import_format_variants::DYLD_CHAINED_IMPORT => {
                 let import = self
@@ -530,7 +532,7 @@ pub unsafe fn fixup_all_chained_fixups(
                         if let Some(shared_cache) = dyld_shared_cache {
                             unsafe {
                                 let dst_addr = dst_ptr.add(page_zero_size).add(*offset) as *mut u64;
-                                *dst_addr = shared_cache
+                                let resolved_symbol = shared_cache
                                     .symbol_resolve(
                                         dylibs[*ordinal as usize - 1].as_bytes(),
                                         symbol_name.as_bytes(),
@@ -538,6 +540,15 @@ pub unsafe fn fixup_all_chained_fixups(
                                     .ok_or_else(
                                         || "could not find a symbol in the dyld shared cache",
                                     )?;
+
+                                // println!(
+                                //     "0x{:x} ({:x}): {} -> 0x{:x}",
+                                //     dst_addr.addr(),
+                                //     *dst_addr,
+                                //     symbol_name.as_str(),
+                                //     resolved_symbol
+                                // );
+                                *dst_addr = resolved_symbol;
                             };
                         } else {
                             return Err(

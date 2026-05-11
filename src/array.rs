@@ -97,7 +97,7 @@ unsafe impl<'a, A: ?Sized + UninitArray> UninitArray for &'a mut A {
 pub type ArrayVec<T, const N: usize> = FixedVec<[MaybeUninit<T>; N]>;
 
 /// A vector of fixed size. It cannot grow.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FixedVec<A: ?Sized + UninitArray> {
     len: u32,
     array: A,
@@ -361,7 +361,7 @@ pub type ArrayString<const N: usize> = FixedString<[MaybeUninit<u8>; N]>;
 /// A string of fixed size, backed by a [`FixedVec`] of bytes.
 ///
 /// The contents are always guaranteed to be valid UTF-8.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FixedString<A: ?Sized + UninitArray<Item = u8>> {
     vec: FixedVec<A>,
 }

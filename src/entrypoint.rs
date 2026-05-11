@@ -3,12 +3,15 @@ use core::ptr::NonNull;
 use alloc::vec::Vec;
 
 use crate::{
+    DYLD_LIKELY_UNSLID_VM_ADDR, LIBSYSTEM_PATH,
+    array::ArrayVec,
     bindings_macho::{CPU_TYPE_ARM64, fat_arch, fat_header, mach_header_64, mach_magic},
     container::Container,
     dsc,
     dyld_shared_cache::DyldSharedCache,
     dynld::{dynamically_link, macho_endian_from_magic},
-    fixups::Fixup,
+    fixups::{Fixup, FixupKind, fixup_all_chained_fixups},
+    image::Symbol,
     jump,
     libc::exit_error,
     println_err,
@@ -22,17 +25,17 @@ use crate::{
 /// This function never returns and if an internal error happens, it will loop
 /// infinitly.
 pub fn dynld_entrypoint(
-    _self_bind_fixups: Vec<Fixup>,
+    self_bind_fixups: Vec<Fixup>,
+    dylinker_container: Container<'_>,
     executable_header: *mut mach_header_64,
     executable_size: usize,
     argc: usize,
     argv: *const *const u8,
     envp: *const *const u8,
-    _apple: *const *const u8,
+    apple: *const *const u8,
 ) -> ! {
     let image_raw_bytes =
         unsafe { core::slice::from_raw_parts(executable_header as *const u8, executable_size) };
-
     let image_mach_magic =
         unsafe { core::ptr::read_unaligned(executable_header as *const mach_magic) };
 
@@ -52,22 +55,21 @@ pub fn dynld_entrypoint(
         exit_error()
     }
 
-    // let mut image_infos = dsc::user64_dyld_all_image_infos::default();
-    // if unsafe { dsc::dyld_all_image_infos_get(&mut image_infos) } == 0 {
-    //     println_err!("failed to find the dyld_shared_cache base address");
-    //     exit_error()
-    // }
-
-    // print!("{image_infos:#?}");
-
     let mut dyld_shared_cache = DyldSharedCache::new();
     if let Err(err) = unsafe {
         dyld_shared_cache.from_live_mapping_initialize(
             dyld_shared_cache_baddr_in_vm as *const u8,
-            dyld_shared_cache_baddr_in_vm - 0x180000000,
+            dyld_shared_cache_baddr_in_vm - DYLD_LIKELY_UNSLID_VM_ADDR,
         )
     } {
         println_err!("failed initializing dyld shared cache: '{err}'");
+        exit_error()
+    }
+
+    if let Err(err) =
+        tls_functions_self_bind_hack(&dylinker_container, self_bind_fixups, &dyld_shared_cache)
+    {
+        println_err!("failed to bind TLS function to self: '{err}'");
         exit_error()
     }
 
@@ -83,9 +85,7 @@ pub fn dynld_entrypoint(
         exit_error()
     }
 
-    //unsafe {
-    //    tlv_initialize_descriptors_export(executable_header as *const mach_header_64);
-    //}
+    //println!("[+] dylinking OK, jumping to 0x{entry_point:x}");
 
     // jump to the entrypoint. We should make sure that this is OK to do
     // before doing this, we fully expect everything to work
@@ -95,6 +95,7 @@ pub fn dynld_entrypoint(
             argc,
             argv,
             envp,
+            apple,
         )
     };
 
@@ -103,6 +104,53 @@ pub fn dynld_entrypoint(
     // if that does not work
 
     exit_error()
+}
+
+/// This function takes the fixups required for TLS to work.
+///
+/// The functions in `libtlv` handle thread local variables, but they
+/// require libraries that we do not yet link to. We extracted the fixups
+/// previously and now we apply them.
+///
+/// This isn't a very pleasant way to do so but for now this does the job
+fn tls_functions_self_bind_hack(
+    self_container: &Container<'_>,
+    mut self_bind_fixups: Vec<Fixup>,
+    dyld_shared_cache: &DyldSharedCache<'_>,
+) -> Result<(), &'static str> {
+    let mut self_bind_symbols = Vec::new();
+    let mut self_bind_dylibs = ArrayVec::new_array();
+    self_bind_dylibs.push(LIBSYSTEM_PATH);
+
+    for bind in self_bind_fixups.iter_mut() {
+        match &mut bind.kind {
+            FixupKind::Bind {
+                symbol_name,
+                ordinal,
+                ..
+            } => {
+                *ordinal = 1;
+                self_bind_symbols.push(Symbol::make_undefined(symbol_name.clone(), 1, false));
+            }
+            _ => (),
+        }
+    }
+
+    if let Err(err) = unsafe {
+        fixup_all_chained_fixups(
+            self_container.as_bytes().as_ptr() as *mut u8,
+            0,
+            &self_bind_fixups,
+            &self_bind_symbols,
+            &self_bind_dylibs,
+            Some(&dyld_shared_cache),
+            false,
+        )
+    } {
+        return Err(err);
+    };
+
+    Ok(())
 }
 
 /// Tries to find an image with a `CPU_TYPE_ARM64` cputype

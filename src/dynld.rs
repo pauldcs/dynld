@@ -18,7 +18,7 @@ use crate::{
     dyld_shared_cache::DyldSharedCache,
     fixups::{Fixup, fixup_all_chained_fixups},
     image::{Image, Segment, Symbol},
-    jump, mach,
+    jump, mach, tlv,
 };
 
 pub fn macho_endian_from_magic(magic: mach_magic) -> container::Endian {
@@ -48,7 +48,7 @@ struct ParsedImage<'a> {
 /// Dynamically link the program.
 ///
 /// On return the image has been mapped, fixed up, and its initializers
-/// have run; jumping to the returned address enters the program safely.
+/// have run, jumping to the returned address enters the program safely.
 pub fn dynamically_link(
     dyld_shared_cache: &DyldSharedCache<'_>,
     image: Container<'_>,
@@ -58,6 +58,10 @@ pub fn dynamically_link(
 
     let mut loaded_dylibs: ArrayVec<&str, 32> = ArrayVec::new_array();
     for (lib_name, _) in parsed.libraries {
+        if loaded_dylibs.len() == 32 {
+            return Err("exceeded maximum loaded dylib amout");
+        }
+
         loaded_dylibs.push(lib_name);
     }
 
@@ -73,7 +77,12 @@ pub fn dynamically_link(
         )?
     };
 
+    if parsed.has_thread_locals {
+        thread_local_variables_init(vm);
+    }
+
     apply_segment_protections(vm, &parsed.segments)?;
+
     run_initializers(vm, &parsed.init_functions);
 
     unsafe {
@@ -226,12 +235,19 @@ fn classify_defined_symbol(
     entry: &nlist_64,
     symbols: &mut Vec<Symbol>,
 ) -> Result<(), &'static str> {
-    let name = read_symbol_name(
+    let name = match read_symbol_name(
         image,
         stroff,
         entry.n_un.n_strx,
         "could not read symbol name",
-    )?;
+    ) {
+        Ok(name) => name,
+        Err(_) => {
+            // maybe emit warning?
+            return Ok(());
+        }
+    };
+
     let value = entry.n_value as usize;
     let sect = entry.n_sect;
     let cold = (entry.n_desc & N_COLD_FUNC) != 0;
@@ -298,12 +314,19 @@ fn classify_undefined_symbol(
         unimplemented!("n_type: {}", entry.n_type & N_TYPE);
     }
 
-    let name = read_symbol_name(
+    let name = match read_symbol_name(
         image,
         stroff,
         entry.n_un.n_strx,
         "could not read symbol name",
-    )?;
+    ) {
+        Ok(name) => name,
+        Err(_) => {
+            // maybe emit warning?
+            return Ok(());
+        }
+    };
+
     symbols.push(Symbol::make_undefined(
         name,
         get_library_ordinal(entry.n_desc),
@@ -461,7 +484,16 @@ fn run_initializers(vm: NonNull<u8>, init_functions: &[usize]) {
                 0,
                 [core::ptr::null()].as_ptr(),
                 [core::ptr::null()].as_ptr(),
+                [core::ptr::null()].as_ptr(),
             );
         }
+    }
+}
+
+fn thread_local_variables_init(vm: NonNull<u8>) {
+    unsafe {
+        tlv::tlv_initialize_descriptors_export(
+            vm.add(PAGE_ZERO_SIZE).as_ptr() as *const mach_header_64
+        );
     }
 }
