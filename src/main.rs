@@ -6,11 +6,11 @@ use crate::{
     array::ArrayVec,
     bindings_macho::{mach_header_64, mach_magic},
     container::Container,
-    dynld::macho_endian_from_magic,
     entrypoint::dynld_entrypoint,
     fixups::{Fixup, FixupKind, fixup_all_chained_fixups},
     image::Image,
     libc::{EXIT_FAILURE, STDERR_FILENO, exit_error},
+    loader::macho_endian_from_magic,
 };
 use core::arch::global_asm;
 
@@ -34,12 +34,12 @@ mod allocator;
 mod array;
 mod container;
 mod dyld_shared_cache;
-mod dynld;
 mod entrypoint;
 mod fixups;
 mod image;
 mod jump;
 mod libc;
+mod loader;
 mod print;
 //mod ptrauth;
 mod syscalls;

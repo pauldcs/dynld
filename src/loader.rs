@@ -49,11 +49,11 @@ struct ParsedImage<'a> {
 ///
 /// On return the image has been mapped, fixed up, and its initializers
 /// have run, jumping to the returned address enters the program safely.
-pub fn dynamically_link(
+pub fn macho_loader(
     dyld_shared_cache: &DyldSharedCache<'_>,
     image: Container<'_>,
 ) -> Result<u64, &'static str> {
-    let parsed = parse_image(&image)?;
+    let parsed = macho_parser(&image)?;
     let (vm, _vm_size) = map_segments(&image, &parsed.segments)?;
 
     let mut loaded_dylibs: ArrayVec<&str, 32> = ArrayVec::new_array();
@@ -95,7 +95,7 @@ pub fn dynamically_link(
 }
 
 /// Walk every load command once and gather everything we need to link
-fn parse_image<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'static str> {
+fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'static str> {
     let mut parsed = ParsedImage {
         segments: ArrayVec::new_array(),
         fixups: Vec::new(),

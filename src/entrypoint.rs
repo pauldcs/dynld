@@ -9,11 +9,11 @@ use crate::{
     container::Container,
     dsc,
     dyld_shared_cache::DyldSharedCache,
-    dynld::{dynamically_link, macho_endian_from_magic},
     fixups::{Fixup, FixupKind, fixup_all_chained_fixups},
     image::Symbol,
     jump,
     libc::exit_error,
+    loader::{macho_endian_from_magic, macho_loader},
     println_err,
 };
 
@@ -73,7 +73,7 @@ pub fn dynld_entrypoint(
         exit_error()
     }
 
-    let entry_point = dynamically_link(&dyld_shared_cache, image).unwrap_or_else(|err| {
+    let entry_point = macho_loader(&dyld_shared_cache, image).unwrap_or_else(|err| {
         println_err!("dylinking error: '{err}', giving up...");
         exit_error()
     });
