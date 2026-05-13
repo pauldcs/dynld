@@ -1096,6 +1096,15 @@ pub struct entry_point_command {
     pub stacksize: u64,
 }
 
+/// The rpath_command contains a path which at runtime should be added to
+/// the current run path used to find @rpath prefixed dylibs.
+#[derive(Copy, Clone, Debug, Pread)]
+pub struct rpath_command {
+    pub cmd: u32,     /* LC_RPATH */
+    pub cmdsize: u32, /* includes string */
+    pub path: lc_str, /* path to add to run path */
+}
+
 /*
  * This is the symbol table entry structure for 64-bit architectures.
  */

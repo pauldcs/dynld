@@ -1,14 +1,10 @@
 //! On-disk layout of the dyld shared cache.
-//!
-//! Direct translation of `<mach-o/dyld_cache_format.h>`. Field ordering and
-//! sizes match the C definitions exactly so these can be deserialised
-//! straight from a memory-mapped cache file.
 
 use core::ffi::c_char;
 use scroll_derive::Pread;
 
-/// Header at offset 0 of every dyld shared cache file.
 #[repr(C)]
+/// `dyld_cache_header` copied from XNU
 #[derive(Debug, Clone, Copy, Pread)]
 pub struct dyld_cache_header {
     /// e.g. "dyld_v0    i386"

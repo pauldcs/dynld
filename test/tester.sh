@@ -210,7 +210,7 @@ function __path_mode() {
                 --error-exitcode=1                                                 \
                 ./"$program_name" $extra_args "$input_file" &> "$actual_output_file"
     else
-        ./"$program_name" $extra_args "$input_file" ../target/aarch64-apple-darwin/release/dynld &> "$actual_output_file"
+        ./"$program_name" $extra_args "$(realpath "$input_file")" ../target/aarch64-apple-darwin/release/dynld &> "$actual_output_file"
     fi
     exit_code=$?
     return $exit_code

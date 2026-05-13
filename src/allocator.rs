@@ -1,7 +1,4 @@
-//! A simple global allocator backed by our mach vm wrappers. This was prompted from
-//! Claude and i did not test it properly at all. We should replace this with a better
-//! allocator as soon as possible. This is only used for things such as holding symbols,
-//! which are not expected to change (not a lot of alloc/dealloc)
+//! this was prompted from claude i will one day make a proper one
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -28,8 +25,14 @@ pub const PAGE_SIZE: usize = 4096;
 pub const CHUNK_SIZE: usize = 64 * PAGE_SIZE; // 256 KiB
 pub const LARGE_THRESHOLD: usize = CHUNK_SIZE / 2;
 
-/// Frees smaller than this are leaked due to the shitty design of this whole thing
+/// Minimum reusable allocation size: a freed block must be at least large
+/// enough to hold a `FreeNode` written into it. All small allocations are
+/// rounded up to this size so every dealloc can be tracked.
 pub const MIN_REUSE: usize = mem::size_of::<FreeNode>();
+
+/// Minimum alignment for any allocation we manage. Freed blocks have a
+/// `FreeNode` written into them, so every block must be aligned for one.
+pub const MIN_ALIGN: usize = mem::align_of::<FreeNode>();
 
 /// A free-list node, written into the freed memory itself.
 #[repr(C)]
@@ -44,7 +47,7 @@ unsafe impl Send for FreeNode {}
 struct State {
     /// Current bump chunk: pointer to start, total size, and offset.
     chunk: Option<Chunk>,
-    /// Free list head (first-fit search, simple and small).
+    /// Free list head (first-fit search, with splitting on take).
     free: Option<NonNull<FreeNode>>,
 }
 
@@ -98,15 +101,23 @@ impl Allocator {
         result
     }
 
-    fn alloc_impl(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(1);
-        let align = layout.align().max(1);
+    /// Normalize a `Layout` to the (size, align) pair we actually allocate.
+    ///
+    /// - Size is rounded up to at least `MIN_REUSE` *and* to a multiple of
+    ///   `MIN_ALIGN`. The first guarantees freed blocks can hold a `FreeNode`;
+    ///   the second means every block boundary is `FreeNode`-aligned, which
+    ///   makes the splitting logic in `take_from_free_list` trivially sound.
+    /// - Align is bumped to at least `MIN_ALIGN` so freed pointers are always
+    ///   `FreeNode`-aligned when we write a node into them on dealloc.
+    fn normalize(layout: Layout) -> (usize, usize) {
+        let raw = layout.size().max(MIN_REUSE);
+        let size = align_up(raw, MIN_ALIGN);
+        let align = layout.align().max(MIN_ALIGN);
+        (size, align)
+    }
 
-        if size < MIN_REUSE {
-            // this is shameful but one day i will fix this and write a proper
-            // allocator
-            panic!("attempted to alloc something smaller that a FreeNode")
-        }
+    fn alloc_impl(&self, layout: Layout) -> *mut u8 {
+        let (size, align) = Self::normalize(layout);
 
         if size >= LARGE_THRESHOLD {
             return match self.backend.alloc(size) {
@@ -124,6 +135,7 @@ impl Allocator {
                 return p.as_ptr();
             }
 
+            // Current chunk (if any) can't satisfy the request. Grab a new one.
             let chunk_size = CHUNK_SIZE.max(size + align);
             let base = match backend.alloc(chunk_size) {
                 Ok(p) => p,
@@ -142,22 +154,18 @@ impl Allocator {
     }
 
     unsafe fn dealloc_impl(&self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size().max(1);
         let Some(nn) = NonNull::new(ptr) else { return };
+        let (size, _align) = Self::normalize(layout);
 
         if size >= LARGE_THRESHOLD {
             let _ = unsafe { self.backend.dealloc(nn, size) };
             return;
         }
 
-        if size < MIN_REUSE {
-            // Too small to track, leak
-            return;
-        }
-
         self.with_state(|state, _| {
-            // SAFETY: ptr is a valid, unique allocation of at least `size` bytes,
-            // and `size >= MIN_REUSE` so a FreeNode fits.
+            // SAFETY: every allocation we hand out is at least `MIN_REUSE`
+            // bytes and aligned to at least `MIN_ALIGN`, so a `FreeNode`
+            // fits and is properly aligned here.
             let node = nn.cast::<FreeNode>();
             unsafe {
                 node.as_ptr().write(FreeNode {
@@ -202,17 +210,47 @@ fn bump_alloc(state: &mut State, size: usize, align: usize) -> Option<NonNull<u8
     NonNull::new(aligned as *mut u8)
 }
 
-/// Walk the free list, return the first node that fits with the right alignment.
+/// Walk the free list and return the first node that fits with the right
+/// alignment. If the node has enough leftover room to hold another `FreeNode`,
+/// split it: hand back the head, return the tail to the list.
 fn take_from_free_list(state: &mut State, size: usize, align: usize) -> Option<NonNull<u8>> {
     let mut cursor: *mut Option<NonNull<FreeNode>> = &mut state.free;
     unsafe {
         while let Some(node) = *cursor {
-            let node_ref = node.as_ref();
+            let node_size = node.as_ref().size;
+            let node_next = node.as_ref().next;
             let addr = node.as_ptr() as usize;
-            if node_ref.size >= size && addr == align_up(addr, align) {
-                *cursor = node_ref.next;
+
+            // Aligned, since every block we hand out is `MIN_ALIGN`-aligned
+            // and any user-requested alignment is also bumped to a power of
+            // two ≥ MIN_ALIGN. But double-check rather than assume.
+            if node_size >= size && addr % align == 0 {
+                // Unlink this node from the list.
+                *cursor = node_next;
+
+                // If the tail has room for another FreeNode, split it.
+                //
+                // Alignment is automatic: `addr` is MIN_ALIGN-aligned because
+                // every pointer we hand out is, and `size` is a multiple of
+                // MIN_ALIGN because `normalize` rounds it up. So `addr + size`
+                // is MIN_ALIGN-aligned and fit for a FreeNode write.
+                let leftover = node_size - size;
+                if leftover >= MIN_REUSE {
+                    let tail_addr = addr + size;
+                    // SAFETY: tail_addr is within the original block, is
+                    // MIN_ALIGN-aligned (see above), and has `leftover` bytes
+                    // available with leftover >= MIN_REUSE = size_of::<FreeNode>().
+                    let tail = tail_addr as *mut FreeNode;
+                    tail.write(FreeNode {
+                        next: state.free,
+                        size: leftover,
+                    });
+                    state.free = Some(NonNull::new_unchecked(tail));
+                }
+
                 return Some(node.cast::<u8>());
             }
+
             cursor = &mut (*node.as_ptr()).next;
         }
     }

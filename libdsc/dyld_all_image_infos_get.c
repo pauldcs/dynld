@@ -158,7 +158,7 @@ _mach_port_mod_refs(mach_port_t        target,
     register uint64_t x0  __asm__("x0")  = (uint64_t)target;
     register uint64_t x1  __asm__("x1")  = (uint64_t)name;
     register uint64_t x2  __asm__("x2")  = (uint64_t)right;
-    register uint64_t x3  __asm__("x3")  = (uint64_t)(uint32_t)delta;   // avoid sign-extension of negative deltas
+    register uint64_t x3  __asm__("x3")  = (uint64_t)(uint32_t)delta;
     register uint64_t x16 __asm__("x16") = MACH_PORT_MOD_REFS_TRAP;
     __asm__ volatile (
         "svc #0x80"

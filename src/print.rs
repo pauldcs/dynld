@@ -2,8 +2,9 @@ use core::fmt::{self, Write};
 
 use crate::libc::{self, STDERR_FILENO, STDOUT_FILENO};
 
-/// Attempts to write data to the object referenced by the descriptor `fildes`
-/// from the buffer pointed to by `buf`
+extern crate alloc;
+use alloc::string::String;
+
 fn write_all(fd: usize, mut buf: &[u8]) -> Result<(), usize> {
     while !buf.is_empty() {
         match libc::write(fd, buf) {
@@ -71,4 +72,18 @@ macro_rules! println_err {
         $crate::print::_print_err(format_args!($($arg)*));
         $crate::print::_print_err(format_args!("\n"));
     }};
+}
+
+#[doc(hidden)]
+pub fn _format(args: fmt::Arguments<'_>) -> String {
+    let mut s = String::new();
+    s.write_fmt(args).unwrap();
+    s
+}
+
+#[macro_export]
+macro_rules! format {
+    ($($arg:tt)*) => {
+        $crate::print::_format(format_args!($($arg)*))
+    };
 }

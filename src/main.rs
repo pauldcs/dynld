@@ -24,6 +24,8 @@ mod bindings_dsc;
 #[allow(unused)] // some code is usused there but will become useful
 mod bindings_macho;
 
+mod user_dylibs;
+
 #[allow(non_camel_case_types)]
 mod mach;
 
@@ -40,8 +42,11 @@ mod image;
 mod jump;
 mod libc;
 mod loader;
+mod macho_image;
 mod print;
 //mod ptrauth;
+mod dylib;
+mod mmap;
 mod syscalls;
 mod tlv;
 
@@ -123,7 +128,7 @@ fn rebase_self_and_extract_bind_fixups(dylinker_container: &Container<'_>) -> Ve
                         0,
                         &fixups,
                         &Vec::new(),
-                        &ArrayVec::new_array(),
+                        &Vec::new(),
                         None,
                         true,
                     )

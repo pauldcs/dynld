@@ -1,10 +1,9 @@
 use core::ptr::NonNull;
 
-use alloc::vec::Vec;
+use alloc::{string::ToString, vec::Vec};
 
 use crate::{
     DYLD_LIKELY_UNSLID_VM_ADDR, LIBSYSTEM_PATH,
-    array::ArrayVec,
     bindings_macho::{CPU_TYPE_ARM64, fat_arch, fat_header, mach_header_64, mach_magic},
     container::Container,
     dsc,
@@ -13,17 +12,49 @@ use crate::{
     image::Symbol,
     jump,
     libc::exit_error,
-    loader::{macho_endian_from_magic, macho_loader},
+    loader::{Library, macho_endian_from_magic, macho_loader},
     println_err,
 };
 
-/// The main entrypoint of the dynld
+/// Extracts the directory portion of a path, dropping the final component.
+pub fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => ".",
+    }
+}
+
+/// Reads `argv[0]` as a null-terminated UTF-8 string
 ///
-/// This function is meant to take a pointer to the [`mach_header_64`] with
-/// the size of the executable. It dynamically links it and executes it.
+/// # Safety
+/// `argv` must point to a non-null, null terminated array of C strings,
+/// as provided by main in C
+pub unsafe fn argv0<'a>(argv: *const *const u8) -> Option<&'a str> {
+    unsafe {
+        let arg0 = *argv;
+        if arg0.is_null() {
+            return None;
+        }
+
+        let mut len = 0;
+        while *arg0.add(len) != 0 {
+            len += 1;
+        }
+
+        str::from_utf8(core::slice::from_raw_parts(arg0, len)).ok()
+    }
+}
+
+/// Extracts the directory containing the executable from a C style argv
 ///
-/// This function never returns and if an internal error happens, it will loop
-/// infinitly.
+/// # Safety
+/// See [`argv0`].
+pub unsafe fn exe_dir<'a>(argv: *const *const u8) -> Option<&'a str> {
+    unsafe { argv0(argv).map(dir_of) }
+}
+
+/// The main entrypoint of dynld
 pub fn dynld_entrypoint(
     self_bind_fixups: Vec<Fixup>,
     dylinker_container: Container<'_>,
@@ -36,6 +67,7 @@ pub fn dynld_entrypoint(
 ) -> ! {
     let image_raw_bytes =
         unsafe { core::slice::from_raw_parts(executable_header as *const u8, executable_size) };
+
     let image_mach_magic =
         unsafe { core::ptr::read_unaligned(executable_header as *const mach_magic) };
 
@@ -57,7 +89,7 @@ pub fn dynld_entrypoint(
 
     let mut dyld_shared_cache = DyldSharedCache::new();
     if let Err(err) = unsafe {
-        dyld_shared_cache.from_live_mapping_initialize(
+        dyld_shared_cache.from_existing(
             dyld_shared_cache_baddr_in_vm as *const u8,
             dyld_shared_cache_baddr_in_vm - DYLD_LIKELY_UNSLID_VM_ADDR,
         )
@@ -73,25 +105,26 @@ pub fn dynld_entrypoint(
         exit_error()
     }
 
-    let entry_point = macho_loader(&dyld_shared_cache, image).unwrap_or_else(|err| {
-        println_err!("dylinking error: '{err}', giving up...");
-        exit_error()
-    });
+    let exec_dir = unsafe {
+        exe_dir(argv).unwrap_or_else(|| {
+            println_err!("failed to get the exeutable path of the program");
+            exit_error()
+        })
+    };
 
-    // we only check that the entrypoint is not NULL, if
-    // it is something else, we expect it to be valid at this point
-    if entry_point == 0 {
-        println_err!("the entry_point of the program is NULL, giving up...");
-        exit_error()
-    }
+    let (_vm, entrypoint) =
+        macho_loader(&dyld_shared_cache, image, exec_dir, None).unwrap_or_else(|err| {
+            println_err!("dylinking error: '{err}', giving up...");
+            exit_error()
+        });
 
-    //println!("[+] dylinking OK, jumping to 0x{entry_point:x}");
+    //println!("[+] dylinking OK, jumping to 0x{entrypoint:x}");
 
     // jump to the entrypoint. We should make sure that this is OK to do
     // before doing this, we fully expect everything to work
     unsafe {
         jump::entry_and_ret(
-            NonNull::new_unchecked(entry_point as *mut u8),
+            NonNull::new_unchecked(entrypoint as *mut u8),
             argc,
             argv,
             envp,
@@ -119,8 +152,8 @@ fn tls_functions_self_bind_hack(
     dyld_shared_cache: &DyldSharedCache<'_>,
 ) -> Result<(), &'static str> {
     let mut self_bind_symbols = Vec::new();
-    let mut self_bind_dylibs = ArrayVec::new_array();
-    self_bind_dylibs.push(LIBSYSTEM_PATH);
+    let mut self_bind_dylibs = Vec::new();
+    self_bind_dylibs.push(Library::System(LIBSYSTEM_PATH.to_string()));
 
     for bind in self_bind_fixups.iter_mut() {
         match &mut bind.kind {

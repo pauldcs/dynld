@@ -1,11 +1,13 @@
 //! A Mach-O Chained Fixup parser
 
 extern crate alloc;
+use core::mem::MaybeUninit;
+
 use alloc::vec::Vec;
 
 use crate::{
     SYMBOL_NAME_LEN,
-    array::{ArrayString, ArrayVec},
+    array::{ArrayString, FixedString},
     bindings_macho::{
         BIND_SPECIAL_DYLIB_FLAT_LOOKUP, BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE,
         BIND_SPECIAL_DYLIB_SELF, BIND_SPECIAL_DYLIB_WEAK_LOOKUP, dyld_chained_fixups_header,
@@ -19,7 +21,9 @@ use crate::{
         mach_header_64,
     },
     dyld_shared_cache::DyldSharedCache,
+    dylib::{DylibSymbol, dylib_symbol_resolve},
     image::{Image, LCIterator, Symbol},
+    loader::Library,
 };
 
 const PAGE_STARTS_OFFSET: u32 = 22;
@@ -481,7 +485,7 @@ pub unsafe fn fixup_all_chained_fixups(
     page_zero_size: usize,
     fixups: &Vec<Fixup>,
     symbols: &Vec<Symbol>,
-    dylibs: &ArrayVec<&str, 32>,
+    dylibs: &Vec<Library>,
     dyld_shared_cache: Option<&DyldSharedCache<'_>>,
     ignore_binds: bool,
 ) -> Result<(), &'static str> {
@@ -520,45 +524,105 @@ pub unsafe fn fixup_all_chained_fixups(
                         return Err("BIND_SPECIAL_DYLIB_FLAT_LOOKUP is not yet supported");
                     }
                     BIND_SPECIAL_DYLIB_WEAK_LOOKUP => unsafe {
-                        let dst_addr = dst_ptr.add(*offset).add(page_zero_size) as *mut u64;
-                        let symbol = symbols
-                            .iter()
-                            .find(|sym| sym.array_string_cmp(symbol_name))
-                            .ok_or("could not find a matching symbol while fixing up a BIND_SPECIAL_DYLIB_WEAK_LOOKUP")?;
-
-                        *dst_addr = (dst_ptr.add(symbol.impl_offset).addr()) as u64;
+                        fixup_dylib_weak_symbol(
+                            dst_ptr,
+                            *offset,
+                            page_zero_size,
+                            symbols,
+                            symbol_name,
+                        )?;
                     },
-                    _ => {
-                        if let Some(shared_cache) = dyld_shared_cache {
-                            unsafe {
-                                let dst_addr = dst_ptr.add(page_zero_size).add(*offset) as *mut u64;
-                                let resolved_symbol = shared_cache
-                                    .symbol_resolve(
-                                        dylibs[*ordinal as usize - 1].as_bytes(),
-                                        symbol_name.as_bytes(),
-                                    )?
-                                    .ok_or_else(
-                                        || "could not find a symbol in the dyld shared cache",
-                                    )?;
-
-                                // println!(
-                                //     "0x{:x} ({:x}): {} -> 0x{:x}",
-                                //     dst_addr.addr(),
-                                //     *dst_addr,
-                                //     symbol_name.as_str(),
-                                //     resolved_symbol
-                                // );
-                                *dst_addr = resolved_symbol;
-                            };
-                        } else {
-                            return Err(
-                                "could not apply fixup chains as there was not shared cache provided",
-                            );
-                        }
-                    }
+                    _ => unsafe {
+                        fixup_regular_symbol(
+                            dst_ptr,
+                            *offset,
+                            page_zero_size,
+                            symbol_name,
+                            &dylibs[*ordinal as usize - 1],
+                            dyld_shared_cache,
+                        )?;
+                    },
                 };
             }
         }
     }
+    Ok(())
+}
+
+unsafe fn fixup_dylib_weak_symbol(
+    vm_start_ptr: *mut u8,
+    fixup_offset: usize,
+    page_zero_size: usize,
+    symbols: &Vec<Symbol>,
+    symbol_name: &FixedString<[MaybeUninit<u8>; SYMBOL_NAME_LEN]>,
+) -> Result<(), &'static str> {
+    unsafe {
+        let dst_addr = vm_start_ptr.add(fixup_offset).add(page_zero_size) as *mut u64;
+        let symbol = symbols
+            .iter()
+            .find(|sym| sym.array_string_cmp(symbol_name))
+            .ok_or(
+                "could not find a matching symbol while fixing up a BIND_SPECIAL_DYLIB_WEAK_LOOKUP",
+            )?;
+
+        //println!(
+        //    "0x{:x} ({:x}): {} -> 0x{:x}",
+        //    dst_addr.addr(),
+        //    *dst_addr,
+        //    symbol_name.as_str(),
+        //    symbol.impl_offset
+        //);
+
+        *dst_addr = (vm_start_ptr.add(symbol.impl_offset).addr()) as u64;
+    }
+    Ok(())
+}
+
+unsafe fn fixup_regular_symbol(
+    vm_start_ptr: *mut u8,
+    fixup_offset: usize,
+    page_zero_size: usize,
+    symbol_name: &FixedString<[MaybeUninit<u8>; SYMBOL_NAME_LEN]>,
+    library: &Library,
+    dyld_shared_cache: Option<&DyldSharedCache<'_>>,
+) -> Result<(), &'static str> {
+    match library {
+        Library::System(library_name) if let Some(shared_cache) = dyld_shared_cache => unsafe {
+            let dst_addr = vm_start_ptr.add(page_zero_size).add(fixup_offset) as *mut u64;
+            let resolved_symbol = shared_cache
+                .symbol_resolve(library_name.as_bytes(), symbol_name.as_bytes())?
+                .ok_or_else(|| "could not find a symbol in the dyld shared cache")?;
+
+            //println!(
+            //    "0x{:x} ({:x}): {} -> 0x{:x}",
+            //    dst_addr.addr(),
+            //    *dst_addr,
+            //    symbol_name.as_str(),
+            //    resolved_symbol
+            //);
+
+            *dst_addr = resolved_symbol;
+        },
+        Library::User(lib_container) => {
+            let sym = dylib_symbol_resolve(lib_container, symbol_name.as_bytes())?
+                .ok_or_else(|| "failed to find symbol in user dylib")?;
+            match sym {
+                DylibSymbol::Defined {
+                    offset_from_mach_header,
+                } => unsafe {
+                    let dst_addr = vm_start_ptr.add(page_zero_size).add(fixup_offset) as *mut u64;
+                    let a = lib_container
+                        .as_bytes()
+                        .as_ptr()
+                        .add(offset_from_mach_header as usize);
+
+                    *dst_addr = a.addr() as u64;
+                },
+                DylibSymbol::Reexported { .. } => unimplemented!("DylibSymbol::Reexported"),
+            }
+        }
+        _ => return Err("failed to link library"),
+    }
+
     Ok(())
 }

@@ -1,7 +1,10 @@
 use core::ptr::NonNull;
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crate::{
     PAGE_ZERO_SIZE, SYMBOL_NAME_LEN,
@@ -11,14 +14,16 @@ use crate::{
         N_SYMBOL_RESOLVER, N_TYPE, N_UNDF, N_WEAK_DEF, N_WEAK_REF, S_INIT_FUNC_OFFSETS,
         S_THREAD_LOCAL_VARIABLES, SECTION_TYPE, SEG_DATA, SEG_TEXT, dylib_command,
         entry_point_command, get_library_ordinal, load_command, load_command_variants,
-        mach_header_64, mach_magic, macho_filetype_variants, nlist_64, section_64,
+        mach_header_64, mach_magic, macho_filetype_variants, nlist_64, rpath_command, section_64,
         segment_command_64, symtab_command,
     },
     container::{self, Container},
     dyld_shared_cache::DyldSharedCache,
     fixups::{Fixup, fixup_all_chained_fixups},
+    format,
     image::{Image, Segment, Symbol},
     jump, mach, tlv,
+    user_dylibs::disk_path_mmap,
 };
 
 pub fn macho_endian_from_magic(magic: mach_magic) -> container::Endian {
@@ -33,69 +38,195 @@ pub fn macho_endian_from_magic(magic: mach_magic) -> container::Endian {
     }
 }
 
+/// This is a placeholder at the root of a path to let you know
+/// how to look for the rest of the path. eg:
+///     @rpath/libfoo.dylib
+pub enum Rpath {
+    /// Resolves to the directory containing the binary that has this load command
+    LoaderPath,
+    /// Resolves to the directory containing the main executable
+    ExecutablePath,
+    /// A placeholder that gets resolved against the list of run-path search paths
+    RPath,
+}
+
 /// Parsed contents of a Mach-O image, ready to be mapped and linked.
-struct ParsedImage<'a> {
+pub struct ParsedImage {
     segments: ArrayVec<Segment, 64>,
     fixups: Vec<Fixup>,
     symbols: Vec<Symbol>,
     init_functions: Vec<usize>,
-    libraries: ArrayVec<(&'a str, usize), 64>,
-    entry_point: usize,
+    libraries: ArrayVec<(String, usize), 64>,
+    pub entry_point: usize,
     has_thread_locals: bool,
     is_dylib: bool,
+    pub rpath: Option<Rpath>,
+}
+
+pub enum Library<'image> {
+    System(String),
+    User(Container<'image>),
 }
 
 /// Dynamically link the program.
 ///
 /// On return the image has been mapped, fixed up, and its initializers
 /// have run, jumping to the returned address enters the program safely.
-pub fn macho_loader(
+///
+/// IMPORTANT: if this is a dylib , it returns the address at which it is loaded and its size,
+/// if it is an executable it returns the address at which it is loaded and its entrypoint
+pub fn macho_loader<'image>(
     dyld_shared_cache: &DyldSharedCache<'_>,
-    image: Container<'_>,
-) -> Result<u64, &'static str> {
-    let parsed = macho_parser(&image)?;
-    let (vm, _vm_size) = map_segments(&image, &parsed.segments)?;
+    image: Container<'image>,
+    exec_dir: &str,
+    dylib_dir: Option<&str>,
+) -> Result<(NonNull<u8>, usize), &'static str> {
+    let is_executable = dylib_dir.is_none();
+    let parsed_image = macho_parser(&image)?;
 
-    let mut loaded_dylibs: ArrayVec<&str, 32> = ArrayVec::new_array();
-    for (lib_name, _) in parsed.libraries {
-        if loaded_dylibs.len() == 32 {
-            return Err("exceeded maximum loaded dylib amout");
-        }
+    let dependencies = dependencies_collect(&parsed_image, dyld_shared_cache)?;
+    let dylib_images = user_dylibs_load_recursively(
+        &dependencies,
+        dyld_shared_cache,
+        exec_dir,
+        &parsed_image.rpath,
+    )?;
 
-        loaded_dylibs.push(lib_name);
-    }
+    let (vm, vm_size) =
+        macho_segments_map_to_vm(dylib_dir.is_none(), &image, &parsed_image.segments)?;
 
-    unsafe {
-        fixup_all_chained_fixups(
-            vm.as_ptr() as *mut u8,
-            PAGE_ZERO_SIZE,
-            &parsed.fixups,
-            &parsed.symbols,
-            &loaded_dylibs,
-            Some(dyld_shared_cache),
-            false,
-        )?
-    };
+    image_fixups_apply(
+        vm,
+        &parsed_image,
+        &dylib_images,
+        dyld_shared_cache,
+        is_executable,
+    )?;
 
-    if parsed.has_thread_locals {
-        thread_local_variables_init(vm);
-    }
+    image_finalize(vm, &parsed_image, is_executable)?;
 
-    apply_segment_protections(vm, &parsed.segments)?;
-
-    run_initializers(vm, &parsed.init_functions);
-
-    unsafe {
-        Ok(vm
-            .add(parsed.entry_point)
-            .add(PAGE_ZERO_SIZE)
-            .as_ptr()
-            .addr() as u64)
+    match dylib_dir {
+        Some(_) => Ok((vm, vm_size)),
+        None => Ok((vm, unsafe {
+            vm.add(parsed_image.entry_point)
+                .add(PAGE_ZERO_SIZE)
+                .addr()
+                .into()
+        })),
     }
 }
 
+/// Walks the parsed image's `libraries` and returns each path and
+/// wether is is a system library or a user library
+fn dependencies_collect(
+    parsed_image: &ParsedImage,
+    dyld_shared_cache: &DyldSharedCache<'_>,
+) -> Result<ArrayVec<(String, bool), 32>, &'static str> {
+    let mut dependencies: ArrayVec<(String, bool), 32> = ArrayVec::new_array();
+    for (lib_name, _) in &parsed_image.libraries {
+        if dependencies.len() == 32 {
+            return Err("exceeded maximum amount of dylibs");
+        }
+        let is_system_dylib = dyld_shared_cache.is_library_cached(lib_name.as_bytes());
+        dependencies.push((lib_name.to_string(), is_system_dylib));
+    }
+    Ok(dependencies)
+}
+
+/// For every non system libs: resolve its install name to a disk
+/// path, mmap it, and recursively load it. Returns each loaded image
+fn user_dylibs_load_recursively<'a>(
+    dependencies: &ArrayVec<(String, bool), 32>,
+    dyld_shared_cache: &DyldSharedCache<'_>,
+    exec_dir: &str,
+    rpath: &Option<Rpath>,
+) -> Result<Vec<Library<'a>>, &'static str> {
+    let mut loaded = Vec::new();
+    for (install_name, is_system_dylib) in dependencies.iter() {
+        if *is_system_dylib {
+            loaded.push(Library::System(install_name.clone()));
+            continue;
+        }
+        let dylib_path = user_dylib_disk_path_resolve(install_name, rpath, exec_dir);
+
+        let (vm, vm_size) = macho_loader(
+            dyld_shared_cache,
+            disk_path_mmap(dylib_path.as_bytes())?,
+            exec_dir,
+            Some(&dylib_path),
+        )?;
+
+        loaded.push(Library::User(Container::with_bytes(
+            unsafe { core::slice::from_raw_parts(vm.as_ptr() as *const u8, vm_size) },
+            container::Endian::Little,
+        )));
+    }
+
+    Ok(loaded)
+}
+
+/// Turns a dylib install name into a NUL terminated disk path
+fn user_dylib_disk_path_resolve(
+    install_name: &str,
+    rpath: &Option<Rpath>,
+    exec_dir: &str,
+) -> String {
+    let resolved = if let Some(rest) = install_name.strip_prefix("@rpath/") {
+        match rpath {
+            Some(Rpath::LoaderPath) => format!("{exec_dir}/{rest}"),
+            Some(Rpath::ExecutablePath) => format!("{exec_dir}/{rest}"),
+            Some(Rpath::RPath) => unimplemented!("@rpath search paths"),
+            None => rest.to_string(),
+        }
+    } else if let Some(rest) = install_name.strip_prefix("@loader_path/") {
+        format!("{exec_dir}/{rest}")
+    } else if let Some(rest) = install_name.strip_prefix("@executable_path/") {
+        format!("{exec_dir}/{rest}")
+    } else {
+        install_name.to_string()
+    };
+
+    format!("{resolved}\0")
+}
+
+/// Applies chained fixups to the newly mapped image.
+fn image_fixups_apply(
+    vm: NonNull<u8>,
+    parsed_image: &ParsedImage,
+    dependencies: &Vec<Library>,
+    dyld_shared_cache: &DyldSharedCache<'_>,
+    is_executable: bool,
+) -> Result<(), &'static str> {
+    let fixup_base_offset = if is_executable { PAGE_ZERO_SIZE } else { 0 };
+    unsafe {
+        fixup_all_chained_fixups(
+            vm.as_ptr() as *mut u8,
+            fixup_base_offset,
+            &parsed_image.fixups,
+            &parsed_image.symbols,
+            dependencies,
+            Some(dyld_shared_cache),
+            false,
+        )
+    }
+}
+
+/// Initializes TLVs (executable only)
+fn image_finalize(
+    vm: NonNull<u8>,
+    parsed_image: &ParsedImage,
+    is_executable: bool,
+) -> Result<(), &'static str> {
+    if is_executable && parsed_image.has_thread_locals {
+        macho_tlv_initialize(vm);
+    }
+    macho_segments_vm_protect(vm, &parsed_image.segments)?;
+    macho_init_functions_exec(vm, &parsed_image.init_functions);
+    Ok(())
+}
+
 /// Walk every load command once and gather everything we need to link
-fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'static str> {
+fn macho_parser<'a>(image: &Container<'a>) -> Result<ParsedImage, &'static str> {
     let mut parsed = ParsedImage {
         segments: ArrayVec::new_array(),
         fixups: Vec::new(),
@@ -105,6 +236,7 @@ fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'stati
         entry_point: 0,
         has_thread_locals: false,
         is_dylib: false,
+        rpath: None,
     };
 
     let mach_header_64 {
@@ -129,17 +261,17 @@ fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'stati
             load_command_variants::LC_LOAD_DYLIB
             | load_command_variants::LC_LOAD_WEAK_DYLIB
             | load_command_variants::LC_LAZY_LOAD_DYLIB => {
-                parse_dylib_command(image, offset, &mut parsed.libraries)?;
+                parse_dylib_command(&image, offset, &mut parsed.libraries)?;
             }
             load_command_variants::LC_MAIN => {
-                parsed.entry_point = parse_main_command(image, offset, parsed.is_dylib)?;
+                parsed.entry_point = parse_main_command(&image, offset, parsed.is_dylib)?;
             }
             load_command_variants::LC_SYMTAB => {
-                parse_symtab(image, offset, &mut parsed.symbols)?;
+                parse_symtab(&image, offset, &mut parsed.symbols)?;
             }
             load_command_variants::LC_SEGMENT_64 => {
                 parse_segment(
-                    image,
+                    &image,
                     offset,
                     &mut parsed.segments,
                     &mut parsed.init_functions,
@@ -147,9 +279,13 @@ fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'stati
                 )?;
             }
             load_command_variants::LC_DYLD_CHAINED_FIXUPS => {
-                parsed.fixups = Image::with_container(image).chained_fixups_parse_all()?;
+                parsed.fixups = Image::with_container(&image).chained_fixups_parse_all()?;
             }
-            // Unknown but tolerated: only LC_REQ_DYLD commands are required to be understood.
+            load_command_variants::LC_RPATH => {
+                parse_rpath(&image, offset, &mut parsed.rpath)?;
+            }
+            // this should maybe trigger a warning, we encountered a load command
+            // that should require us to do something
             command if command & LC_REQ_DYLD == 0 => {}
             _ => {}
         }
@@ -163,15 +299,16 @@ fn macho_parser<'a>(image: &'a Container<'a>) -> Result<ParsedImage<'a>, &'stati
 fn parse_dylib_command<'a>(
     image: &'a Container<'a>,
     offset: usize,
-    libraries: &mut ArrayVec<(&'a str, usize), 64>,
+    libraries: &mut ArrayVec<(String, usize), 64>,
 ) -> Result<(), &'static str> {
     let dylib_command { dylib, .. } = image
         .deserialize_type_at_offset(offset)
         .map_err(|_| "could not parse a dylib_command in the inner arm64 image")?;
 
-    let name_offset = offset + dylib.name.offset as usize;
     libraries.push((
-        image.deserialize_string_at_offset(name_offset),
+        image
+            .deserialize_string_at_offset(offset + dylib.name.offset as usize)
+            .to_string(),
         dylib.name.offset as usize,
     ));
     Ok(())
@@ -191,8 +328,27 @@ fn parse_main_command(
     Ok(entryoff as usize)
 }
 
+fn parse_rpath(
+    image: &Container<'_>,
+    offset: usize,
+    rpath: &mut Option<Rpath>,
+) -> Result<(), &'static str> {
+    let rpath_command { path, .. } = image
+        .deserialize_type_at_offset(offset)
+        .map_err(|_| "could not parse `rpath_command` in the inner arm64 image")?;
+
+    match image.deserialize_string_at_offset(offset + path.offset as usize) {
+        "@rpath" => *rpath = Some(Rpath::RPath),
+        "@loader_path" => *rpath = Some(Rpath::LoaderPath),
+        "@executable_path" => *rpath = Some(Rpath::ExecutablePath),
+        _ => return Err("coulnt not parse rpath: unknown placeholder"),
+    }
+
+    Ok(())
+}
+
 /// Parse the symbol table, classifying each entry into a Symbol variant
-/// or rejecting symbol shapes the linker doesn't yet support
+/// or rejecting those that we dont support
 fn parse_symtab(
     image: &Container<'_>,
     offset: usize,
@@ -427,8 +583,9 @@ fn read_init_func_offsets(
 }
 
 /// Allocate a single VM region covering every segment, then copy each
-/// segment's file bytes into its assigned slot
-fn map_segments(
+/// segment's file bytes into them
+fn macho_segments_map_to_vm(
+    skip_page_zero: bool,
     image: &Container<'_>,
     segments: &[Segment],
 ) -> Result<(NonNull<u8>, usize), &'static str> {
@@ -442,9 +599,16 @@ fn map_segments(
 
     for seg in segments {
         // __PAGEZERO has vm_addr == 0
-        if seg.vm_addr == 0 {
+        if skip_page_zero && seg.vm_addr == 0 {
             continue;
         }
+
+        //println!(
+        //    "{:x}, {:x}",
+        //    image.as_bytes().as_ptr().addr(),
+        //    seg.file_offset
+        //);
+
         unsafe {
             mach::vm_copy_into_task_self(
                 image.as_bytes().as_ptr().add(seg.file_offset).addr() as u64,
@@ -453,12 +617,13 @@ fn map_segments(
             );
         }
     }
+
     Ok((vm, vm_size))
 }
 
 /// Apply each segment's permissions. We set max-protection first, then the
-/// current protection, because the current one cannot exceed max.
-fn apply_segment_protections(vm: NonNull<u8>, segments: &[Segment]) -> Result<(), &'static str> {
+/// current protection
+fn macho_segments_vm_protect(vm: NonNull<u8>, segments: &[Segment]) -> Result<(), &'static str> {
     for seg in segments {
         for set_max in [true, false] {
             unsafe {
@@ -476,7 +641,7 @@ fn apply_segment_protections(vm: NonNull<u8>, segments: &[Segment]) -> Result<()
 }
 
 /// Call every initializer collected from S_INIT_FUNC_OFFSETS, in order.
-fn run_initializers(vm: NonNull<u8>, init_functions: &[usize]) {
+fn macho_init_functions_exec(vm: NonNull<u8>, init_functions: &[usize]) {
     for &func in init_functions {
         unsafe {
             jump::entry_and_ret(
@@ -490,7 +655,7 @@ fn run_initializers(vm: NonNull<u8>, init_functions: &[usize]) {
     }
 }
 
-fn thread_local_variables_init(vm: NonNull<u8>) {
+fn macho_tlv_initialize(vm: NonNull<u8>) {
     unsafe {
         tlv::tlv_initialize_descriptors_export(
             vm.add(PAGE_ZERO_SIZE).as_ptr() as *const mach_header_64
