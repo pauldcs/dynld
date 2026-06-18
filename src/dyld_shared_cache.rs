@@ -331,7 +331,6 @@ impl<'image> DyldSharedCache<'image> {
                 ),
             };
         }
-
         self.try_resolve_via_umbrella_reexports(library, symbol, depth_budget_remaining)
     }
 
@@ -342,7 +341,6 @@ impl<'image> DyldSharedCache<'image> {
         symbol: &'r [u8],
     ) -> Result<Option<TrieResolution<'r>>, &'static str> {
         let image = self.image_view_for_library(library);
-
         let Some(ExportsTrieSpan {
             file_offset,
             size_in_bytes,
@@ -351,15 +349,13 @@ impl<'image> DyldSharedCache<'image> {
             return Ok(None);
         };
 
-        let home_subcache = &self.sub_caches[library.sub_cache_index as usize];
-        let Some(trie_unslid_vm_address) =
-            home_subcache.vm_address_for_file_offset(file_offset as u64)
-        else {
+        let Some(linkedit) = image.linkedit_segment_find()? else {
             return Ok(None);
         };
+        let trie_unslid_vm = linkedit.vmaddr + (file_offset as u64 - linkedit.fileoff);
 
         let Some((hosting_subcache_index, trie_runtime_offset)) =
-            self.subcache_and_offset_locate_from_addr(trie_unslid_vm_address)
+            self.subcache_and_offset_locate_from_addr(trie_unslid_vm)
         else {
             return Ok(None);
         };

@@ -22,8 +22,8 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
-#include <mach-o/loader.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,18 +79,14 @@ static void tlv_set_key_for_image(const struct mach_header *mh,
   pthread_mutex_lock(&tlv_live_image_lock);
   if (tlv_live_image_used_count == tlv_live_image_alloc_count) {
     unsigned int newCount =
-			(tlv_live_images == NULL)
-				? 8
-				: 2 * tlv_live_image_alloc_count;
+        (tlv_live_images == NULL) ? 8 : 2 * tlv_live_image_alloc_count;
 
-    struct TLVImageInfo *newBuffer = (struct TLVImageInfo *)malloc(sizeof(TLVImageInfo) * newCount);
+    struct TLVImageInfo *newBuffer =
+        (struct TLVImageInfo *)malloc(sizeof(TLVImageInfo) * newCount);
 
     if (tlv_live_images != NULL) {
-      (void)memcpy(
-				newBuffer,
-				tlv_live_images,
-        sizeof(TLVImageInfo) * tlv_live_image_used_count
-			);
+      (void)memcpy(newBuffer, tlv_live_images,
+                   sizeof(TLVImageInfo) * tlv_live_image_used_count);
       free(tlv_live_images);
     }
     tlv_live_images = newBuffer;
@@ -125,7 +121,7 @@ tlv_allocate_and_initialize_for_key(pthread_key_t key) {
   const struct mach_header *mh = tlv_get_image_for_key(key);
   if (mh == NULL) {
     return NULL; // if data structures are screwed up, don't crash
-	}
+  }
 
   // first pass, find size and template
   uint8_t *start = NULL;
@@ -177,7 +173,7 @@ tlv_allocate_and_initialize_for_key(pthread_key_t key) {
   // no thread local storage in image: should never happen
   if (size == 0) {
     return NULL;
-	}
+  }
 
   // allocate buffer and fill with template
   void *buffer = malloc(size);
@@ -337,7 +333,7 @@ void _tlv_atexit(TermFunc func, void *objAddr) {
 
       for (uint32_t i = 0; i < list->useCount; ++i) {
         newlist->entries[i] = list->entries[i];
-			}
+      }
 
       pthread_setspecific(tlv_terminators_key, newlist);
       free(list);
@@ -413,7 +409,6 @@ __attribute__((visibility("hidden"))) void tlv_initializer(void) {
 // at runtime
 void _tlv_bootstrap(void) { abort(); }
 
-
 void tlv_initialize_descriptors_export(const struct mach_header *mh) {
   tlv_initialize_descriptors(mh);
 }
@@ -427,4 +422,3 @@ void _tlv_atexit(TermFunc func, void *objAddr) {}
 __attribute__((visibility("hidden"))) void tlv_initializer() {}
 
 #endif // __has_feature(tls)
-

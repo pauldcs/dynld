@@ -9,11 +9,16 @@ use alloc::vec::Vec;
 use crate::bindings_dsc::{dyld_info_command, dylib_command_header};
 use crate::bindings_macho::{
     EXPORT_SYMBOL_FLAGS_REEXPORT, linkedit_data_command, load_command, load_command_variants,
-    mach_header_64,
+    mach_header_64, segment_command_64,
 };
 use crate::container::{Container, read_uleb128};
-
 pub const MAX_REEXPORT_RESOLUTION_DEPTH: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkeditSegment {
+    pub vmaddr: u64,
+    pub fileoff: u64,
+}
 
 /// One Mach-O image inside a `Container`
 pub struct MachOImage<'a, 'image> {
@@ -140,6 +145,26 @@ impl<'a, 'image> MachOImage<'a, 'image> {
         })?;
         Ok(paths)
     }
+
+    pub fn linkedit_segment_find(&self) -> Result<Option<LinkeditSegment>, &'static str> {
+        self.load_commands_find(|cmd, command_offset| match cmd {
+            load_command_variants::LC_SEGMENT_64 => {
+                let seg: segment_command_64 = self
+                    .container
+                    .deserialize_type_at_offset(command_offset)
+                    .map_err(|_| "could not read segment_command_64")?;
+                if &seg.segname[..10] == b"__LINKEDIT" {
+                    Ok(Some(LinkeditSegment {
+                        vmaddr: seg.vmaddr,
+                        fileoff: seg.fileoff,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        })
+    }
 }
 
 fn is_dylib_dependency_command(cmd: load_command_variants) -> bool {
@@ -155,6 +180,7 @@ pub struct ExportsTrieSpan {
     pub size_in_bytes: u32,
 }
 
+#[derive(Debug)]
 pub enum ExportTerminal<'a> {
     /// Defined in this image at `mach_header + offset_from_mach_header`.
     DefinedHere { offset_from_mach_header: u64 },
@@ -173,7 +199,16 @@ pub fn exports_trie_walk_for_symbol<'a>(
     let mut current_node_offset: usize = 0;
     let mut remaining_suffix: &[u8] = symbol;
 
+    // A walk visits at most one node per byte of the trie; anything beyond
+    // that is a cycle in malformed data. Guarantees termination.
+    let mut visit_budget = trie_bytes.len();
+
     loop {
+        if visit_budget == 0 {
+            return None;
+        }
+        visit_budget -= 1;
+
         let node = TrieNodeReader::open(trie_bytes, current_node_offset)?;
 
         if remaining_suffix.is_empty() && node.has_terminal_payload() {
@@ -260,14 +295,16 @@ impl<'a> TrieNodeReader<'a> {
             let label_length = self.trie_bytes[label_start..]
                 .iter()
                 .position(|&b| b == 0)?;
+
             let label = &self.trie_bytes[label_start..label_start + label_length];
+
             cursor = label_start + label_length + 1;
 
             let (child_node_offset, offset_field_byte_count) =
                 read_uleb128(&self.trie_bytes[cursor..])?;
             cursor += offset_field_byte_count;
 
-            if remaining_symbol_suffix.starts_with(label) {
+            if !label.is_empty() && remaining_symbol_suffix.starts_with(label) {
                 return Some((label, child_node_offset as usize));
             }
         }

@@ -119,7 +119,6 @@ pub fn dynld_entrypoint(
         });
 
     //println!("[+] dylinking OK, jumping to 0x{entrypoint:x}");
-
     // jump to the entrypoint. We should make sure that this is OK to do
     // before doing this, we fully expect everything to work
     unsafe {
